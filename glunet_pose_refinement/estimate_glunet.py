@@ -108,20 +108,9 @@ def parse_gt(gt_path):
 
 def find_image_path(img_name, search_dir):
     """Find the path of an image by searching recursively in search_dir"""
-    if not img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-        # Try finding img_name/color.png
-        p = Path(search_dir) / img_name / "color.png"
+    for p in Path(search_dir).rglob(img_name):
         if p.is_file():
             return p
-        for p in Path(search_dir).rglob(f"*{img_name}*"):
-            if p.is_dir():
-                color_p = p / "color.png"
-                if color_p.is_file():
-                    return color_p
-    else:
-        for p in Path(search_dir).rglob(img_name):
-            if p.is_file():
-                return p
     return None
 
 def load_image(img_path):
@@ -145,106 +134,18 @@ def load_image(img_path):
     
     return img
 
-def get_plane_from_depth(img_path):
-    """Segment the desk plane from depth.png in camera frame and return R_plane, t_plane"""
-    if img_path is None:
-        return None, None
-        
-    img_path = Path(img_path)
-    # Find depth.png in the same directory as img_path (e.g. pose_1/103927_179558/depth.png)
-    depth_path = img_path.parent / "depth.png"
-    if not depth_path.exists():
-        return None, None
-        
-    depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
-    if depth is None:
-        return None, None
-        
-    # Determine the scaling factor based on the folder path
-    path_str = str(img_path)
-    scale = 1.0
-    if "pose_1" in path_str:
-        scale = 0.9510
-    elif "pose_2" in path_str:
-        scale = 0.9503
-    elif "pose_3" in path_str:
-        scale = 0.9502
-        
-    # Segment desk plane
-    down = 8
-    depth_down = depth[::down, ::down]
-    ys, xs = np.where((depth_down > 300) & (depth_down < 1000))
-    ds = (depth_down[ys, xs].astype(np.float32) / 1000.0) * scale
-    
-    fx, fy = 2251.950927734375, 2251.7568359375
-    cx, cy = 1931.4296875, 1091.6837158203125
-    
-    pts_cam = np.column_stack([(xs * down - cx) * ds / fx, (ys * down - cy) * ds / fy, ds])
-    if len(pts_cam) < 100:
-        return None, None
-        
-    # Downsample points
-    num_pts = len(pts_cam)
-    sample_sz = min(num_pts, 3000)
-    idx_ds = np.random.choice(num_pts, sample_sz, replace=False)
-    pts_cam_ds = pts_cam[idx_ds]
-    
-    # Run RANSAC plane fitting
-    best_inliers = []
-    best_plane = None
-    max_iters = 200
-    threshold = 0.003
-    for _ in range(max_iters):
-        idx = np.random.choice(sample_sz, 3, replace=False)
-        p1, p2, p3 = pts_cam_ds[idx]
-        v1 = p2 - p1
-        v2 = p3 - p1
-        n = np.cross(v1, v2)
-        norm = np.linalg.norm(n)
-        if norm < 1e-6:
-            continue
-        n /= norm
-        d = -np.dot(n, p1)
-        dists = np.abs(np.dot(pts_cam_ds, n) + d)
-        inliers = np.where(dists < threshold)[0]
-        if len(inliers) > len(best_inliers):
-            best_inliers = inliers
-            best_plane = (n, d)
-            
-    if best_plane is None:
-        return None, None
-        
-    # Re-fit with all inliers
-    inliers_pts = pts_cam_ds[best_inliers]
-    centroid = np.mean(inliers_pts, axis=0)
-    centered = inliers_pts - centroid
-    _, _, Vh = np.linalg.svd(centered)
-    n = Vh[2, :]
-    d = -np.dot(n, centroid)
-    
-    # Ensure normal vector points towards the camera (nz < 0)
-    if n[2] > 0:
-        n = -n
-        d = -d
-        
-    return n, d
-
 def estimate_corners_from_aruco(img_path):
     """Estimate board corners in full-resolution coordinates using the ArUco marker + blobs pipeline"""
     try:
         bgr_full = load_image(img_path)
         if bgr_full is None:
             return None, None, None
-        
-        # Get plane normal and offset from depth map if available
-        n_ransac, d_ransac = get_plane_from_depth(img_path)
-        
-        return estimate_corners_from_aruco_img(bgr_full, n_ransac=n_ransac, d_ransac=d_ransac)
+        return estimate_corners_from_aruco_img(bgr_full)
     except Exception as e:
         print(f"Error in ArUco estimation for {img_path.name}: {e}")
         return None, None, None
 
-def estimate_corners_from_aruco_img(img_full, n_ransac=None, d_ransac=None):
+def estimate_corners_from_aruco_img(img_full):
     """Estimate board corners in full-resolution coordinates from a numpy BGR image array"""
     try:
         gray_full = cv2.cvtColor(img_full, cv2.COLOR_BGR2GRAY)
@@ -254,35 +155,7 @@ def estimate_corners_from_aruco_img(img_full, n_ransac=None, d_ransac=None):
         marker = detect_marker_subpix(gray_full)
         if marker is None:
             return None, None, None
-            
-        R_aruco, t_aruco = plane_from_marker(marker)
-        
-        if n_ransac is not None and d_ransac is not None:
-            n = n_ransac
-            d = d_ransac
-            n_aruco = R_aruco[:, 2]
-            
-            # Find rotation matrix R_diff that rotates n_aruco to n
-            v = np.cross(n_aruco, n)
-            s = np.linalg.norm(v)
-            c = np.dot(n_aruco, n)
-            if s < 1e-6:
-                R_diff = np.eye(3)
-                if c < 0:
-                    R_diff = -np.eye(3)
-            else:
-                K_skew = np.array([
-                    [0.0, -v[2], v[1]],
-                    [v[2], 0.0, -v[0]],
-                    [-v[1], v[0], 0.0]
-                ])
-                R_diff = np.eye(3) + K_skew + K_skew @ K_skew * ((1.0 - c) / (s * s))
-                
-            R_plane = R_diff @ R_aruco
-            # Project t_aruco onto the RANSAC plane
-            t_plane = t_aruco - (np.dot(n, t_aruco) + d) * n
-        else:
-            R_plane, t_plane = R_aruco, t_aruco
+        R_plane, t_plane = plane_from_marker(marker)
 
         # Create ROI mask around the marker where the board is expected
         mask = np.zeros((IH, IW), np.uint8)
@@ -338,7 +211,7 @@ def apply_tophat_prep(img, se_sz=25):
     th_norm = cv2.normalize(th, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     return cv2.merge([th_norm, th_norm, th_norm])
 
-def dense_matches(model, src, tgt, device, src_corners=None, max_dim=1024, src_path=None, tgt_path=None):
+def dense_matches(model, src, tgt, device, src_corners=None, max_dim=1024):
     """Run GLU-Net flow estimation on pre-aligned board crops to refine the transformation"""
     h_src, w_src = src.shape[:2]
     h_tgt, w_tgt = tgt.shape[:2]
@@ -370,8 +243,8 @@ def dense_matches(model, src, tgt, device, src_corners=None, max_dim=1024, src_p
 
     # 1. Coarsely estimate board corners in both images using ArUco + blobs
     if src_corners is None:
-        src_corners, _, _ = estimate_corners_from_aruco(src_path) if src_path is not None else estimate_corners_from_aruco_img(src)
-    tgt_corners, _, _ = estimate_corners_from_aruco(tgt_path) if tgt_path is not None else estimate_corners_from_aruco_img(tgt)
+        src_corners, _, _ = estimate_corners_from_aruco_img(src)
+    tgt_corners, _, _ = estimate_corners_from_aruco_img(tgt)
     
     use_board_align = (src_corners is not None) and (tgt_corners is not None)
     
@@ -495,124 +368,6 @@ def draw_matches_visual(img_src, img_tgt, pts_src, pts_tgt, max_matches=100):
         
     return canvas
 
-def backproject_to_board_plane(pts_2d, rv, tv):
-    """Backproject 2D image coordinates (full resolution) to the 3D board plane (Z = 0.025m) in board frame"""
-    R, _ = cv2.Rodrigues(rv)
-    t = tv.ravel()
-    
-    # Intrinsics for full resolution
-    fx, fy = 2251.950927734375, 2251.7568359375
-    cx, cy = 1931.4296875, 1091.6837158203125
-    
-    pts_3d = []
-    Z = 0.025 # Z-coordinate of the board surface
-    
-    for u, v in pts_2d:
-        # Normalized camera coordinates
-        xc = (u - cx) / fx
-        yc = (v - cy) / fy
-        
-        # System: R[:, 0]*X + R[:, 1]*Y - lambda*[xc, yc, 1]^T = -t - R[:, 2]*Z
-        A = np.column_stack([R[:, 0], R[:, 1], np.array([-xc, -yc, -1.0])])
-        b = -t - R[:, 2] * Z
-        try:
-            sol = np.linalg.solve(A, b)
-            pts_3d.append([sol[0], sol[1], Z])
-        except np.linalg.LinAlgError:
-            # Fallback in case A is singular
-            pts_3d.append([0.0, 0.0, Z])
-            
-    return np.array(pts_3d, dtype=np.float32)
-
-def backproject_using_depth(pts_2d, img_path, rv_src, tv_src):
-    """Backproject 2D image coordinates to 3D board frame using the actual depth map (depth.png)"""
-    img_path = Path(img_path)
-    depth_path = img_path.parent / "depth.png"
-    if not depth_path.exists():
-        # Fallback to plane backprojection if depth map is missing
-        return backproject_to_board_plane(pts_2d, rv_src, tv_src)
-        
-    depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
-    if depth is None:
-        return backproject_to_board_plane(pts_2d, rv_src, tv_src)
-        
-    # Scale correction
-    path_str = str(img_path)
-    scale = 1.0
-    if "pose_1" in path_str:
-        scale = 0.9510
-    elif "pose_2" in path_str:
-        scale = 0.9503
-    elif "pose_3" in path_str:
-        scale = 0.9502
-        
-    # Intrinsics
-    fx, fy = 2251.950927734375, 2251.7568359375
-    cx, cy = 1931.4296875, 1091.6837158203125
-    
-    R_src, _ = cv2.Rodrigues(rv_src)
-    t_src = tv_src.ravel()
-    R_src_T = R_src.T
-    
-    pts_3d = []
-    h, w = depth.shape
-    
-    for u, v in pts_2d:
-        # Get depth value at pixel (u, v)
-        iu, iv = int(round(u)), int(round(v))
-        iu = min(max(0, iu), w - 1)
-        iv = min(max(0, iv), h - 1)
-        
-        d_val = depth[iv, iu]
-        if d_val > 0:
-            Z = (float(d_val) / 1000.0) * scale
-        else:
-            # Fallback to Z = 0.025
-            xc = (u - cx) / fx
-            yc = (v - cy) / fy
-            A = np.column_stack([R_src[:, 0], R_src[:, 1], np.array([-xc, -yc, -1.0])])
-            b = -t_src - R_src[:, 2] * 0.025
-            try:
-                sol = np.linalg.solve(A, b)
-                pts_3d.append([sol[0], sol[1], 0.025])
-            except np.linalg.LinAlgError:
-                pts_3d.append([0.0, 0.0, 0.025])
-            continue
-            
-        # Backproject to camera coordinates
-        X = (u - cx) * Z / fx
-        Y = (v - cy) * Z / fy
-        P_cam = np.array([X, Y, Z])
-        
-        # Transform to board coordinates: P_board = R_src^T * (P_cam - t_src)
-        P_board = R_src_T @ (P_cam - t_src)
-        pts_3d.append(P_board)
-        
-    return np.array(pts_3d, dtype=np.float32)
-
-
-def undistort_corners(corners, img_path):
-    """Undistort 2D corners annotated on the raw distorted color images using the camera intrinsics and distortion model"""
-    if corners is None or img_path is None:
-        return corners
-    if "images_depth" not in str(img_path):
-        return corners
-        
-    K_new = np.array([
-        [2251.950927734375, 0.0, 1931.4296875],
-        [0.0, 2251.7568359375, 1091.6837158203125],
-        [0.0, 0.0, 1.0]
-    ], dtype=np.float32)
-    D_new = np.array([0.07524467259645462, -0.10655965656042099, -0.00023194379173219204, 0.00031730238697491586, 0.044881995767354965], dtype=np.float32)
-    
-    pts_undistorted = cv2.undistortPoints(
-        np.array(corners, dtype=np.float32).reshape(-1, 1, 2),
-        K_new,
-        D_new,
-        P=K_new
-    ).reshape(-1, 2)
-    return pts_undistorted
-
 def lookup_gt(path, gt):
     """Retrieve ground-truth corners for a file using exact name or path substring match"""
     path_str = str(path)
@@ -632,20 +387,12 @@ def evaluate_pair(model, src_path, tgt_path, gt, device, out_dir):
     src_corners_gt = lookup_gt(src_path, gt)
     tgt_corners_gt = lookup_gt(tgt_path, gt)
     
-    # Undistort ground-truth corners for the new camera setup
-    src_corners_gt = undistort_corners(src_corners_gt, src_path)
-    tgt_corners_gt = undistort_corners(tgt_corners_gt, tgt_path)
-    
     src_corners = src_corners_gt
     src_method = "Ground Truth"
     
-    rv_src, tv_src = None, None
     if src_corners is None:
-        src_corners, rv_src, tv_src = estimate_corners_from_aruco(src_path)
+        src_corners, _, _ = estimate_corners_from_aruco(src_path)
         src_method = "ArUco Estimate"
-    else:
-        src_corners_720 = src_corners * S
-        rv_src, tv_src = solve_corners(src_corners_720)
         
     if src_corners is None:
         print(f"[Warning] Could not get source corners for {src_name} (no GT and no ArUco detected). Skipping pair.")
@@ -661,7 +408,7 @@ def evaluate_pair(model, src_path, tgt_path, gt, device, out_dir):
     h_src, w_src = img_src.shape[:2]
     h_tgt, w_tgt = img_tgt.shape[:2]
     
-    pts_src, pts_tgt = dense_matches(model, img_src, img_tgt, device, src_corners=src_corners, src_path=src_path, tgt_path=tgt_path)
+    pts_src, pts_tgt = dense_matches(model, img_src, img_tgt, device, src_corners=src_corners)
     
     # 3. Filter matches using the source board mask
     # Bounding contour: TL -> TR -> BR -> BL
@@ -671,15 +418,6 @@ def evaluate_pair(model, src_path, tgt_path, gt, device, out_dir):
     mask = np.zeros((h_src, w_src), dtype=np.uint8)
     cv2.fillPoly(mask, [contour.astype(np.int32)], 255)
     
-    # Mask out the 16 shape cutout holes to restrict matches to the flat top surface
-    if rv_src is not None and tv_src is not None:
-        centers_720 = project(MODEL_CENTERS, rv_src, tv_src)
-        centers_full = centers_720 / S
-        tz = float(tv_src.ravel()[2])
-        r_px = int(round(0.022 * 2252.0 / tz)) if tz > 0 else 50
-        for pt in centers_full:
-            cv2.circle(mask, (int(round(pt[0])), int(round(pt[1]))), r_px, 0, -1)
-            
     xs = np.clip(np.round(pts_src[:, 0]).astype(np.int32), 0, w_src - 1)
     ys = np.clip(np.round(pts_src[:, 1]).astype(np.int32), 0, h_src - 1)
     
@@ -692,7 +430,7 @@ def evaluate_pair(model, src_path, tgt_path, gt, device, out_dir):
         return None
         
     # 4. Compute homography H from matches
-    H, h_mask = cv2.findHomography(pts_src_filtered, pts_tgt_filtered, cv2.USAC_MAGSAC, 2.0)
+    H, h_mask = cv2.findHomography(pts_src_filtered, pts_tgt_filtered, cv2.RANSAC, 5.0)
     if H is None:
         print(f"[Warning] Homography estimation failed for {src_name} -> {tgt_name}.")
         return None
@@ -705,20 +443,22 @@ def evaluate_pair(model, src_path, tgt_path, gt, device, out_dir):
     # 5. Predict target corners
     pred_corners = cv2.perspectiveTransform(src_corners.reshape(-1, 1, 2), H).reshape(-1, 2)
     
-    # Project board corners
-    pred_corners_720 = pred_corners * S
-    rv, tv = solve_corners(pred_corners_720)
-    proj_corners_720_board = project(CORNER_3D, rv, tv)
-    proj_corners_full_board = proj_corners_720_board / S
-    
     # 6. Quantitative Error
     err = None
     if tgt_corners_gt is not None:
         err = np.linalg.norm(pred_corners - tgt_corners_gt, axis=1).mean()
+        
+    # 7. Solve 3D target pose from predicted corners
+    pred_corners_720 = pred_corners * S
+    rv, tv = solve_corners(pred_corners_720)
     
     # Project model shape centers
     proj_centers_720 = project(MODEL_CENTERS, rv, tv)
     proj_centers_full = proj_centers_720 / S
+    
+    # Project board corners
+    proj_corners_720_board = project(CORNER_3D, rv, tv)
+    proj_corners_full_board = proj_corners_720_board / S
     
     # ArUco estimate on target (for visual comparison)
     tgt_corners_aruco, _, _ = estimate_corners_from_aruco(tgt_path)
@@ -773,35 +513,11 @@ def evaluate_pair(model, src_path, tgt_path, gt, device, out_dir):
     collage = np.vstack([top_row, bottom_row])
     
     # Save the collage
-    src_stem = Path(src_name).stem
-    tgt_stem = Path(tgt_name).stem
-    if "images_depth" in src_path.parts:
-        src_stem = src_path.parent.name
-    if "images_depth" in tgt_path.parts:
-        tgt_stem = tgt_path.parent.name
-        
-    out_path = out_dir / f"match_{src_stem}_to_{tgt_stem}.png"
+    out_path = out_dir / f"match_{Path(src_name).stem}_to_{Path(tgt_name).stem}.png"
     cv2.imwrite(str(out_path), collage)
     
-    init_err = None
-    if tgt_corners_aruco is not None and tgt_corners_gt is not None:
-        init_err = np.linalg.norm(tgt_corners_aruco - tgt_corners_gt, axis=1).mean()
-        
-    print(f"Processed: {src_stem} -> {tgt_stem} | Matches: {len(pts_src_inliers)} | GLU-Net Corner Err: {f'{err:.2f} px' if err is not None else 'N/A'} | Initial constrained Err: {f'{init_err:.2f} px' if init_err is not None else 'N/A'}")
+    print(f"Processed: {src_name} -> {tgt_name} | Matches: {len(pts_src_inliers)} | Corner Error: {f'{err:.2f} px' if err is not None else 'N/A'}")
     return err
-
-def get_dataset_and_pose(path):
-    """Determine dataset (wood/depth) and pose name (pose_1/2/3) from image path"""
-    parts = path.parts
-    if "images_wood" in parts:
-        idx = parts.index("images_wood")
-        pose = parts[idx + 1]
-        return "wood", pose
-    elif "images_depth" in parts:
-        idx = parts.index("images_depth")
-        pose = parts[idx + 1]
-        return "depth", pose
-    return None, None
 
 def main():
     parser = argparse.ArgumentParser(description="Estimate board transformation between two photos using GLU-Net")
@@ -812,7 +528,7 @@ def main():
     args = parser.parse_args()
 
     # Setup directories
-    images_dir = ROOT / "images"
+    images_wood_dir = ROOT / "images" / "images_wood"
     gt_path = ROOT / "images" / "ground truth.txt"
     out_dir = HERE / "out"
     out_dir.mkdir(exist_ok=True, parents=True)
@@ -840,26 +556,21 @@ def main():
         # Find paths for all annotated images
         annotated_paths = {}
         for name in annotated_images:
-            p = find_image_path(name, images_dir)
+            p = find_image_path(name, images_wood_dir)
             if p is not None:
                 annotated_paths[name] = p
                 
         valid_names = list(annotated_paths.keys())
         print(f"Found {len(valid_names)} annotated images out of {len(annotated_images)}")
         
-        # Form all unique ordered pairs (excluding self-pairs, same dataset/pose only)
+        # Form all unique ordered pairs (excluding self-pairs)
         pairs = []
         for i, name_s in enumerate(valid_names):
             for j, name_t in enumerate(valid_names):
                 if i != j:
-                    path_s = annotated_paths[name_s]
-                    path_t = annotated_paths[name_t]
-                    ds_s, pose_s = get_dataset_and_pose(path_s)
-                    ds_t, pose_t = get_dataset_and_pose(path_t)
-                    if ds_s is not None and ds_s == ds_t and pose_s == pose_t:
-                        pairs.append((path_s, path_t))
-                        
-        print(f"Filtered pairs (same dataset and pose folder) to evaluate: {len(pairs)}")
+                    pairs.append((annotated_paths[name_s], annotated_paths[name_t]))
+                    
+        print(f"Total pairs to evaluate: {len(pairs)}")
         
         errors = []
         for src_path, tgt_path in tqdm(pairs):
@@ -878,7 +589,7 @@ def main():
         annotated_images = list(gt.keys())
         annotated_paths = {}
         for name in annotated_images:
-            p = find_image_path(name, images_dir)
+            p = find_image_path(name, images_wood_dir)
             if p is not None:
                 annotated_paths[name] = p
                 
@@ -896,11 +607,11 @@ def main():
             # Check if arguments are paths or filenames
             src_path = Path(args.source)
             if not src_path.exists():
-                src_path = find_image_path(args.source, images_dir)
+                src_path = find_image_path(args.source, images_wood_dir)
                 
             tgt_path = Path(args.target)
             if not tgt_path.exists():
-                tgt_path = find_image_path(args.target, images_dir)
+                tgt_path = find_image_path(args.target, images_wood_dir)
                 
             if src_path is None or not src_path.exists() or tgt_path is None or not tgt_path.exists():
                 print(f"[Error] Could not locate source/target images. Source: {args.source}, Target: {args.target}")
