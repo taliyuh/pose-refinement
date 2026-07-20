@@ -338,7 +338,7 @@ def apply_tophat_prep(img, se_sz=25):
     th_norm = cv2.normalize(th, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     return cv2.merge([th_norm, th_norm, th_norm])
 
-def dense_matches(model, src, tgt, device, src_corners=None, max_dim=1024, src_path=None, tgt_path=None):
+def dense_matches(model, src, tgt, device, src_corners=None, max_dim=1024, src_path=None, tgt_path=None, tgt_corners_override=None):
     """Run GLU-Net flow estimation on pre-aligned board crops to refine the transformation"""
     h_src, w_src = src.shape[:2]
     h_tgt, w_tgt = tgt.shape[:2]
@@ -371,7 +371,10 @@ def dense_matches(model, src, tgt, device, src_corners=None, max_dim=1024, src_p
     # 1. Coarsely estimate board corners in both images using ArUco + blobs
     if src_corners is None:
         src_corners, _, _ = estimate_corners_from_aruco(src_path) if src_path is not None else estimate_corners_from_aruco_img(src)
-    tgt_corners, _, _ = estimate_corners_from_aruco(tgt_path) if tgt_path is not None else estimate_corners_from_aruco_img(tgt)
+    if tgt_corners_override is not None:
+        tgt_corners = tgt_corners_override
+    else:
+        tgt_corners, _, _ = estimate_corners_from_aruco(tgt_path) if tgt_path is not None else estimate_corners_from_aruco_img(tgt)
     
     use_board_align = (src_corners is not None) and (tgt_corners is not None)
     
@@ -680,28 +683,50 @@ def evaluate_pair(model, src_path, tgt_path, gt, device, out_dir):
         for pt in centers_full:
             cv2.circle(mask, (int(round(pt[0])), int(round(pt[1]))), r_px, 0, -1)
             
-    xs = np.clip(np.round(pts_src[:, 0]).astype(np.int32), 0, w_src - 1)
-    ys = np.clip(np.round(pts_src[:, 1]).astype(np.int32), 0, h_src - 1)
-    
-    inside = mask[ys, xs] > 0
-    pts_src_filtered = pts_src[inside]
-    pts_tgt_filtered = pts_tgt[inside]
-    
-    if len(pts_src_filtered) < 10:
-        print(f"[Warning] Too few matches found inside the board for pair {src_name} -> {tgt_name}. Skipping.")
-        return None
-        
-    # 4. Compute homography H from matches
-    H, h_mask = cv2.findHomography(pts_src_filtered, pts_tgt_filtered, cv2.USAC_MAGSAC, 2.0)
+    def compute_inliers_and_homography(p_s_raw, p_t_raw):
+        xs = np.clip(np.round(p_s_raw[:, 0]).astype(np.int32), 0, w_src - 1)
+        ys = np.clip(np.round(p_s_raw[:, 1]).astype(np.int32), 0, h_src - 1)
+        inside = mask[ys, xs] > 0
+        p_src_f = p_s_raw[inside]
+        p_tgt_f = p_t_raw[inside]
+        if len(p_src_f) < 10:
+            return None, None, None, 0
+        H_mat, h_m = cv2.findHomography(p_src_f, p_tgt_f, cv2.USAC_MAGSAC, 2.0)
+        if H_mat is None:
+            return None, None, None, 0
+        inl = h_m.ravel() > 0
+        src_inl = p_src_f[inl]
+        tgt_inl = p_tgt_f[inl]
+        return H_mat, src_inl, tgt_inl, len(src_inl)
+
+    # 4. Compute homography H and inliers from matches
+    H, pts_src_inliers, pts_tgt_inliers, n_inliers = compute_inliers_and_homography(pts_src, pts_tgt)
+
+    # ArUco estimate on target (for visual comparison / flip fallback)
+    tgt_corners_aruco, _, _ = estimate_corners_from_aruco(tgt_path)
+
+    # 180° Flip Fallback: If inliers < 5000, attempt matching with 180° rotated target corners
+    if n_inliers < 5000:
+        base_tgt_corners = tgt_corners_aruco if tgt_corners_aruco is not None else src_corners
+        if base_tgt_corners is not None:
+            tgt_corners_flipped = base_tgt_corners[::-1]
+            pts_src_flip, pts_tgt_flip = dense_matches(
+                model, img_src, img_tgt, device,
+                src_corners=src_corners, src_path=src_path, tgt_path=tgt_path,
+                tgt_corners_override=tgt_corners_flipped
+            )
+            H_flip, src_inl_flip, tgt_inl_flip, n_inliers_flip = compute_inliers_and_homography(pts_src_flip, pts_tgt_flip)
+            if n_inliers_flip > n_inliers:
+                print(f"[180° Flip Adopted] Improved inliers for {src_name}->{tgt_name}: {n_inliers} -> {n_inliers_flip}")
+                H = H_flip
+                pts_src_inliers = src_inl_flip
+                pts_tgt_inliers = tgt_inl_flip
+                n_inliers = n_inliers_flip
+
     if H is None:
         print(f"[Warning] Homography estimation failed for {src_name} -> {tgt_name}.")
         return None
         
-    # Filter matches further by RANSAC inliers
-    inliers = h_mask.ravel() > 0
-    pts_src_inliers = pts_src_filtered[inliers]
-    pts_tgt_inliers = pts_tgt_filtered[inliers]
-    
     # 5. Predict target corners
     pred_corners = cv2.perspectiveTransform(src_corners.reshape(-1, 1, 2), H).reshape(-1, 2)
     
@@ -719,9 +744,6 @@ def evaluate_pair(model, src_path, tgt_path, gt, device, out_dir):
     # Project model shape centers
     proj_centers_720 = project(MODEL_CENTERS, rv, tv)
     proj_centers_full = proj_centers_720 / S
-    
-    # ArUco estimate on target (for visual comparison)
-    tgt_corners_aruco, _, _ = estimate_corners_from_aruco(tgt_path)
     
     # 8. Visualizations
     # Image 1: Source with corners
@@ -910,3 +932,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
