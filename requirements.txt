@@ -1,0 +1,21 @@
+# Metrology pipeline (glunet_pose_refinement2). Python 3.12.
+#
+#   python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# Versions are pinned where the pipeline was validated against them. The
+# reported numbers -- rim residual 0.265 px, chain residual 0.762 mm,
+# multi-view split-half 0.208 mm -- were produced on exactly this set.
+numpy==1.26.4
+scipy==1.11.4
+opencv-contrib-python==4.11.0.86
+trimesh==5.0.0
+tqdm==4.70.0
+
+# NOT required by the metrology pipeline, and deliberately not pinned here:
+#
+#   torch, torchvision, cuda-*   the GLU-Net seeding stage, replaced by
+#                                seed_board.py -- see glunet_src/ (gitignored)
+#   gtsam                        the old factor-graph pose solver
+#   blenderproc, bpy             synthetic_dataset generation
+#   rclpy, sensor_msgs, tf2_ros  capture_board_view.py only, and they come
+#                                from the system ROS 2 install, not from pip

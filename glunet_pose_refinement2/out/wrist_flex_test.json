@@ -1,0 +1,63 @@
+{
+  "joint offsets only": {
+    "params": 4,
+    "median_mm": 0.7619149815132311,
+    "p90_mm": 1.409233735677418
+  },
+  "+ wrist flex (theta_6)": {
+    "params": 16,
+    "median_mm": 0.4998987477214992,
+    "p90_mm": 0.9144811550103963,
+    "rot_amplitude_deg": 0.24663527973535684,
+    "trans_amplitude_mm": 1.016396190484014
+  },
+  "+ gravity flex (TCP)": {
+    "params": 22,
+    "median_mm": 0.4520682716857236,
+    "p90_mm": 0.7990682773916662,
+    "rot_amplitude_deg": 0.25923555966247314,
+    "trans_amplitude_mm": 1.539621018686202
+  },
+  "+ PLACEBO fake_x": {
+    "params": 22,
+    "median_mm": 0.500824493655052,
+    "p90_mm": 0.8059414189606913,
+    "rot_amplitude_deg": 0.29932757063329624,
+    "trans_amplitude_mm": 0.891618302373949
+  },
+  "+ PLACEBO fake_y": {
+    "params": 22,
+    "median_mm": 0.4588043378570962,
+    "p90_mm": 0.906542115984802,
+    "rot_amplitude_deg": 0.2748765351251188,
+    "trans_amplitude_mm": 1.8295845006368678
+  },
+  "wrist flex (theta_6) LOFO": {
+    "baseline_median_mm": 0.6452462445600488,
+    "transferred_median_mm": 0.5146513815497303,
+    "folds_improved": 11,
+    "folds": 11,
+    "verdict": "PASS"
+  },
+  "gravity flex (TCP) LOFO": {
+    "baseline_median_mm": 0.6452462445600488,
+    "transferred_median_mm": 0.40640505567967805,
+    "folds_improved": 11,
+    "folds": 11,
+    "verdict": "PASS"
+  },
+  "PLACEBO fake_x (no gravity meaning) LOFO": {
+    "baseline_median_mm": 0.6452462445600488,
+    "transferred_median_mm": 0.4083162056176942,
+    "folds_improved": 11,
+    "folds": 11,
+    "verdict": "PASS"
+  },
+  "PLACEBO fake_y (no gravity meaning) LOFO": {
+    "baseline_median_mm": 0.6452462445600488,
+    "transferred_median_mm": 0.452282207482723,
+    "folds_improved": 11,
+    "folds": 11,
+    "verdict": "PASS"
+  }
+}

@@ -1,0 +1,63 @@
+name: 3d keypoints -> 2d
+bottom-right corner: 16 -12.5 2.5 -> 2907 1837
+bottom-left corner: -16 -12.5 2.5 -> 1002, 1837
+top-left corner: -16 12.5 2.5 -> 982, 353
+top-right corner: 16 12.5 2.5 -> 2909 307
+
+m left-up corner: -15.399 12.05 2.5 -> 1013, 378
+m left-down corner: -15.399 10.891 2.5 -> 1014, 450
+m right-down corner: -14.251 10.891 2.5 -> 1083, 449
+m right-up corner: -14.251 12.05 2.5 -> 1083, 378
+
+1st i top-left corner: -12.052 11.76 2.5 -> 1214, 395
+1st i top-right corner: -11.921 11.76 2.5 -> 1224, 395
+1st i bottom-left corner: -12.053 10.891 2.5 -> 1216, 444
+1st i bottom-right corner: -11.921 10.891 2.5 -> 1225, 444
+
+
+n top-left corner: -5.3535 12.05 2.5 -> 1616, 375
+n top-right corner: -4.4478 12.05 2.5 -> 1671, 375
+n bottom-left corner: -5.3535 10.891 2.5 -> 1617, 448
+n bottom-right corner: -4.4478 10.891 2.5 -> 1671, 445
+
+t right-down corner: -2.8378 10.899 2.5	-> 1768, 445
+
+counting down from top:
+1st cylinder center: -12.784 6.5 2.5 -> 1179, 713
+2nd cylinder center: -12.784 1.25 2.5 -> 1184, 1026
+3rd cylinder center: -12.784 -3.865 2.5 -> 1188, 1329
+4th cylinder center: -12.784 -9.5033 2.5 -> 1191, 1665
+
+1st hexagon top-right corner: -6.2236 7.3055 2.5 -> 1570, 659
+1st hexagon top-left corner: -7.1913 7.3663 2.5 -> 1510, 657
+1st hexagon middle-left corner: -7.7256 6.564 2.5 -> 1479, 707
+1st hexagon bottom-right corner: -6.3325 5.6318 2.5 -> 1561, 762
+1st hexagon middle-right corner: -5.7944 6.436 2.5 -> 1595, 714
+1st hexagon bottom-left cornet: -7.2964 5.6945 2.5 -> 1505, 761
+
+2nd hexagon top-left corner: -7.3328 2.0449 2.5 -> 1505, 974
+3rd hexagon top-left corner: -7.202 -2.9416 2.5 -> 1518, 1268
+4th hexagon top-left corner: -7.0571 -8.4036 2.5 -> 1529, 1591 
+
+1st triangle top corner: -0.20342 7.3798 2.5 -> 1927, 652
+1st triangle right corner: 0.86484 6.2404 2.5 -> 1993, 721
+1st triangle left corner: -0.66432 5.8888 2.5 -> 1900, 745
+
+4th triangle top-left corner: -0.69642 -8.5264 2.5 -> 1904, 1593
+
+1st rectangle top-left corner: 5.7015 7.3795 2.5 -> 2279, 648
+1st rectangle top-right corner: 7.0463 6.608 2.5 -> 2362, 694
+1st rectangle bottom-right corner: 6.4703 5.6175 2.5 -> 2325, 758
+1st rectangle bottom-left corner: 5.139 6.3818 2.5 -> 2243, 713
+
+2nd rectangle right corner: 7.0558 1.1347 2.5 -> 2362, 1021
+4th rectangle bottom-right corner: 6.8158 -10.42 2.5 -> 2353, 1713
+
+4th l short-down corner: 12.68 -8.1319 2.5 -> 2705, 1575
+4th l short-up corner: 11.924 -8.3592 2.5 -> 2657, 1589
+4th l inner corner: 12.094 -9.141 2.5 -> 2669, 1633
+4th l long-right corner: 10.303 -9.7455 2.5 -> 2563, 1668
+4th l long-left corner: 10.563 -10.595 2.5 -> 2577, 1723
+4th l outer corner: 13.186 -9.7971 2.5 -> 2737, 1676
+
+
