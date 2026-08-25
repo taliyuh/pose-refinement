@@ -40,8 +40,7 @@ sys.path.insert(0, str(HERE))
 import board_model  # noqa: E402
 import board_scatter as BS  # noqa: E402
 from fit_rims6 import RT, refine  # noqa: E402
-from tilt_vs_depth import K_4K  # noqa: E402
-from fit_dense_on_table import D_4K  # noqa: E402
+from camera import K_4K, D_4K  # noqa: E402
 
 FLIP_MM = 50.0     # deviation from folder consensus that counts as gross
 

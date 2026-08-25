@@ -22,11 +22,10 @@ from scipy.optimize import least_squares
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(ROOT / "refinement_proposal"))
 
 import board_model  # noqa: E402
 from bundle_rims import load_views, project_with_normals  # noqa: E402
-from fit_dense_on_table import edge_search  # noqa: E402
+from camera import edge_search  # noqa: E402
 
 HALF_DIAG = 0.2032
 

@@ -124,34 +124,39 @@ def yaw_about_normal(T, C):
     return ang, axis_z
 
 
-def board_poses(src, cache_p, use_offsets=None, gate=1.2):
+def board_poses(src, cache_p=None, use_offsets=None, gate=1.2):
     """T_base_board per view, grouped by folder, with a per-mount hand-eye X."""
     B = json.load(open(src))
     views = B["views"] if isinstance(B, dict) else B
     board = {(r["pose"], r["view"]): np.asarray(r["T_cam_board"]) for r in views}
     mad = {(r["pose"], r["view"]): r.get("mad_px") for r in views}
 
-    # T_base_tcp: from joints where available (so offsets can be applied),
-    # else from the logged pose.txt in the cache.
+    # T_base_tcp comes from the joint angles, so joint offsets can be applied.
     rows = []
     for p, v, th, T, eff, bf in K.load_joint_views():
         if (p, v) in board:
             rows.append([p, v, th, T, board[(p, v)], mad[(p, v)]])
-    have = {(r[0], r[1]) for r in rows}
-    cache = json.load(open(cache_p))
-    for p in cache:
-        for v, rec in cache[p].items():
-            if (int(p), v) in have or (int(p), v) not in board:
-                continue
-            if rec.get("T_base_tcp") is None:
-                continue
-            rows.append([int(p), v, None, np.asarray(rec["T_base_tcp"]),
-                         board[(int(p), v)], mad[(int(p), v)]])
+
+    # Legacy fallback: captures made before capture_board_view.py logged
+    # joints.json have only the FK output, cached externally. Optional, and
+    # unnecessary for anything captured with this repo -- such views cannot
+    # carry joint offsets either, which is why the cache was retired.
+    if cache_p and Path(cache_p).exists():
+        have = {(r[0], r[1]) for r in rows}
+        cache = json.load(open(cache_p))
+        for p in cache:
+            for v, rec in cache[p].items():
+                if (int(p), v) in have or (int(p), v) not in board:
+                    continue
+                if rec.get("T_base_tcp") is None:
+                    continue
+                rows.append([int(p), v, None, np.asarray(rec["T_base_tcp"]),
+                             board[(int(p), v)], mad[(int(p), v)]])
 
     # FK: recomputed with joint offsets when asked and available, else logged.
     for r in rows:
         if use_offsets is not None and r[2] is not None:
-            r[3] = K.ur5_fk(np.asarray(r[2]) + use_offsets)
+            r[3] = K.fk(np.asarray(r[2]) + use_offsets)
         r.append(None)
 
     out, fitted = {}, {}

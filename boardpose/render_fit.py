@@ -30,8 +30,7 @@ sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(HERE))
 
 import board_model  # noqa: E402
 from bundle_rims import project, project_with_normals  # noqa: E402
-from tilt_vs_depth import K_4K  # noqa: E402
-from fit_dense_on_table import D_4K  # noqa: E402
+from camera import K_4K, D_4K  # noqa: E402
 
 ZOOM = 3
 TILE = 230
@@ -53,7 +52,7 @@ def main():
 
     B = json.load(open(args.src))
     if isinstance(B, list):
-        # flat per-view list (fit_rims6.py / fit_dense_on_table.py): no bundle
+        # flat per-view list (fit_rims6.py): no bundle
         # has run yet, so the camera is the factory one.
         B = {"views": B,
              "intrinsics": [K_4K[0, 0], K_4K[1, 1], K_4K[0, 2], K_4K[1, 2], *D_4K]}

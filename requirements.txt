@@ -1,4 +1,4 @@
-# Metrology pipeline (glunet_pose_refinement2). Python 3.12.
+# Board pose pipeline. Python 3.12.
 #
 #   python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 #
@@ -11,11 +11,12 @@ opencv-contrib-python==4.11.0.86
 trimesh==5.0.0
 tqdm==4.70.0
 
-# NOT required by the metrology pipeline, and deliberately not pinned here:
+# Capture only (boardpose/capture_board_view.py, boardpose/normalize_frames.py).
+# These come from the system ROS 2 install, NOT from pip -- run the capture
+# script with the system interpreter, or build the venv with
+# --system-site-packages if you want one environment for both:
 #
-#   torch, torchvision, cuda-*   the GLU-Net seeding stage, replaced by
-#                                seed_board.py -- see glunet_src/ (gitignored)
-#   gtsam                        the old factor-graph pose solver
-#   blenderproc, bpy             synthetic_dataset generation
-#   rclpy, sensor_msgs, tf2_ros  capture_board_view.py only, and they come
-#                                from the system ROS 2 install, not from pip
+#   rclpy, sensor_msgs, tf2_ros
+#
+# Nothing else is needed. The refinement pipeline is pure numpy/scipy/OpenCV and
+# runs with no GPU, no torch, and no ROS.

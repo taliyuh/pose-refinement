@@ -2,8 +2,9 @@
 """
 fit_rims6.py - full 6-DoF hole-rim fit, seeded per image by seed_board.py.
 
-Replaces fit_dense_on_table.py for captures with no ArUco marker. Two changes,
-both of which remove a dependency rather than add a model:
+Replaces the old on-table fitter (`fit_dense_on_table.py`, removed: it solved
+only yaw/u/v and needed an ArUco marker to seed) for captures with no marker in
+frame. Two changes, both of which remove a dependency rather than add a model:
 
   1. No marker, no cached seed. seed_board.py produces ranked candidate poses
      from the image and its depth frame alone. Each candidate is refined here
@@ -11,7 +12,7 @@ both of which remove a dependency rather than add a model:
      actually being minimised -- instead of on the chamfer score that ranked
      them.
 
-  2. Tilt is FREE. fit_dense_on_table solved only yaw, u, v, and took roll,
+  2. Tilt is FREE. The old fitter solved only yaw, u, v, and took roll,
      pitch and height from a depth plane whose ROI came from the seed pose. A
      wrong seed therefore produced a wrong plane, and no in-plane search could
      recover: measured on pose_12/131731_390724, widening the in-plane search
@@ -24,8 +25,7 @@ both of which remove a dependency rather than add a model:
      seeding and gating, which is where the README already places it (its table
      normal is 0.66 deg off the image-derived one).
 
-Output schema matches fit_dense_on_table.py, so bundle_rims.py consumes it
-unchanged:  --init glunet_pose_refinement2/out/rims6.json
+Output feeds bundle_rims.py unchanged:  --init out/rims6.json
 """
 
 import argparse
@@ -45,8 +45,7 @@ sys.path.insert(0, str(HERE))
 
 import board_model  # noqa: E402
 import seed_board  # noqa: E402
-from tilt_vs_depth import K_4K  # noqa: E402
-from fit_dense_on_table import D_4K, edge_search  # noqa: E402
+from camera import K_4K, D_4K, edge_search  # noqa: E402
 
 
 # ---------------------------------------------------------------- projection

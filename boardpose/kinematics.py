@@ -37,6 +37,7 @@ so the columns are permuted by JOINT_ORDER below.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -46,9 +47,16 @@ from scipy.optimize import least_squares
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 
-ARM_JOINTS = ["right_arm_shoulder_pan_joint", "right_arm_shoulder_lift_joint",
-              "right_arm_elbow_joint", "right_arm_wrist_1_joint",
-              "right_arm_wrist_2_joint", "right_arm_wrist_3_joint"]
+# Joint names as they appear in joints.json, IN KINEMATIC ORDER. The prefix is
+# whatever your robot's driver publishes -- ours is a dual-arm setup, hence
+# "right_arm_". A bare UR driver publishes "shoulder_pan_joint" etc. Set
+# JOINT_PREFIX to match; load_joint_views() skips any capture whose joints.json
+# does not carry all six, so a wrong prefix shows up as "0 captures", not as
+# silently wrong numbers.
+JOINT_PREFIX = "right_arm_"
+ARM_JOINTS = [JOINT_PREFIX + n for n in
+              ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+               "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]]
 
 
 # ---------------------------------------------------------------- SE(3)
@@ -102,12 +110,33 @@ def screw(w, q):
     return np.concatenate([w, -np.cross(w, q)])
 
 
-# ---------------------------------------------------------------- UR5
+# ------------------------------------------------------------- the arm model
 
-# Standard DH, (d, a, alpha) per joint; theta is the variable.
-UR5_D = np.array([0.089159, 0.0, 0.0, 0.10915, 0.09465, 0.0823])
-UR5_A = np.array([0.0, -0.425, -0.39225, 0.0, 0.0, 0.0])
-UR5_ALPHA = np.array([np.pi / 2, 0.0, 0.0, np.pi / 2, -np.pi / 2, 0.0])
+# Standard Denavit-Hartenberg (d, a, alpha) per joint; theta is the variable.
+# The whole UR family is listed because identify_arm() picks between them, and
+# because that identification is the only evidence that the model is right at
+# all -- see the module docstring.
+#
+# ADDING A NON-UR ARM: append its (d, a, alpha) triple here under its own name
+# and pass robot="<name>" (or set ACTIVE_ROBOT). Any 6R arm expressible in
+# standard DH works unchanged. If yours is not -- a 7-DoF arm, or one with a
+# non-DH-able chain -- use fit_poe() at the bottom of this file instead, which
+# identifies a generic product-of-exponentials chain, and give it a decent seed.
+DH = {
+    #          d [m]                                   a [m]                        alpha [rad]
+    "ur3":   ([0.1519, 0, 0, 0.11235, 0.08535, 0.0819], [0, -0.24365, -0.21325, 0, 0, 0], [np.pi/2, 0, 0, np.pi/2, -np.pi/2, 0]),
+    "ur5":   ([0.089159, 0, 0, 0.10915, 0.09465, 0.0823], [0, -0.425, -0.39225, 0, 0, 0], [np.pi/2, 0, 0, np.pi/2, -np.pi/2, 0]),
+    "ur10":  ([0.1273, 0, 0, 0.163941, 0.1157, 0.0922], [0, -0.612, -0.5723, 0, 0, 0], [np.pi/2, 0, 0, np.pi/2, -np.pi/2, 0]),
+    "ur3e":  ([0.15185, 0, 0, 0.13105, 0.08535, 0.0921], [0, -0.24355, -0.2132, 0, 0, 0], [np.pi/2, 0, 0, np.pi/2, -np.pi/2, 0]),
+    "ur5e":  ([0.1625, 0, 0, 0.1333, 0.0997, 0.0996], [0, -0.425, -0.3922, 0, 0, 0], [np.pi/2, 0, 0, np.pi/2, -np.pi/2, 0]),
+    "ur10e": ([0.1807, 0, 0, 0.17415, 0.11985, 0.11655], [0, -0.6127, -0.57155, 0, 0, 0], [np.pi/2, 0, 0, np.pi/2, -np.pi/2, 0]),
+    "ur16e": ([0.1807, 0, 0, 0.17415, 0.11985, 0.11655], [0, -0.4784, -0.36, 0, 0, 0], [np.pi/2, 0, 0, np.pi/2, -np.pi/2, 0]),
+}
+DH = {k: tuple(np.asarray(x, float) for x in v) for k, v in DH.items()}
+
+# The arm the reference dataset was shot on. Override per call with fk(...,
+# robot=), or globally by assigning to this name before anything calls fk().
+ACTIVE_ROBOT = "ur5"
 
 
 def dh(theta, d, a, alpha):
@@ -118,18 +147,36 @@ def dh(theta, d, a, alpha):
                      [0.0,     0.0,      0.0,    1.0]])
 
 
-def ur5_fk(theta, d=UR5_D, a=UR5_A, alpha=UR5_ALPHA):
-    """Tool pose in the ARM base frame."""
+def fk(theta, robot=None):
+    """Tool pose in the ARM base frame, for a 6R arm in standard DH."""
+    d, a, alpha = DH[robot or ACTIVE_ROBOT]
     T = np.eye(4)
     for i in range(6):
         T = T @ dh(theta[i], d[i], a[i], alpha[i])
     return T
 
 
-def fit_base_transform(views, theta_of=None):
+def identify_arm(views, candidates=None):
+    """Which arm is this? Rank the candidates by base-transform scatter.
+
+    T_base_arm = T_base_tcp @ inv(fk(theta)) is the constant mounting transform,
+    so if the model is right it is identical for every capture and its scatter
+    over the captures IS the model error. No optimisation, no seed, no URDF.
+
+    Returns [(name, median_scatter_mm), ...] best first. A correct model sits
+    well under a millimetre; the next-best UR was 20x worse on our data.
+    """
+    out = []
+    for name in (candidates or DH):
+        _, sc = fit_base_transform(views, robot=name)
+        out.append((name, float(np.median(sc))))
+    return sorted(out, key=lambda kv: kv[1])
+
+
+def fit_base_transform(views, theta_of=None, robot=None):
     """The constant T_base_arm implied by each capture, and its scatter."""
     theta_of = theta_of or (lambda v: v[2])
-    Bs = [v[3] @ np.linalg.inv(ur5_fk(theta_of(v))) for v in views]
+    Bs = [v[3] @ np.linalg.inv(fk(theta_of(v), robot)) for v in views]
     t = np.array([B[:3, 3] for B in Bs])
     R = exp_so3(np.mean([log_se3(B)[:3] for B in Bs], axis=0))
     T = np.eye(4); T[:3, :3] = R; T[:3, 3] = t.mean(0)
@@ -139,9 +186,22 @@ def fit_base_transform(views, theta_of=None):
 
 # ---------------------------------------------------------------- data
 
+def parse_pose_txt(path):
+    """T_base_tcp from a capture's pose.txt (a dumped geometry_msgs Transform)."""
+    c = Path(path).read_text()
+    g = lambda k: float(re.search(rf"{k}:\s*([-\d.e+]+)", c).group(1))  # noqa: E731
+    x, y, z, w = g("rotation_x"), g("rotation_y"), g("rotation_z"), g("rotation_w")
+    T = np.eye(4)
+    T[:3, :3] = np.array([
+        [1 - 2*y*y - 2*z*z,     2*x*y - 2*z*w,       2*x*z + 2*y*w],
+        [2*x*y + 2*z*w,         1 - 2*x*x - 2*z*z,   2*y*z - 2*x*w],
+        [2*x*z - 2*y*w,         2*y*z + 2*x*w,       1 - 2*x*x - 2*y*y]])
+    T[:3, 3] = [g("translation_x"), g("translation_y"), g("translation_z")]
+    return T
+
+
 def load_joint_views(poses=None, root=None):
     """(pose, view, theta[6], T_base_tcp, effort[6], base_frame) per capture."""
-    from update_cached_views_all import parse_pose_txt
     root = root or (ROOT / "images" / "images_depth")
     out = []
     for pd in sorted(root.glob("pose_*"), key=lambda p: int(p.name.split("_")[1])):
@@ -211,15 +271,18 @@ def fit_poe(views, verbose=True):
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, str(HERE))
     views = load_joint_views()
     print(f"captures with joint data: {len(views)}")
     # NB: joints.json records the base_frame as captured and is NOT rewritten by
     # normalize_frames.py, so that field is stale. pose.txt is the normalised
     # source of truth; only pose_16 ("world") is still in a foreign frame.
     main_v = [v for v in views if v[0] != 16]
+    print("\narm identification (base-transform scatter, lower is better):")
+    for name, mm in identify_arm(main_v):
+        print(f"    {name:<7} {mm:8.3f} mm" + ("   <- this arm" if mm == min(
+            m for _, m in identify_arm(main_v)) else ""))
     T_arm, sc = fit_base_transform(main_v)
-    print(f"\nUR5 + base transform over {len(main_v)} views "
+    print(f"\n{ACTIVE_ROBOT} + base transform over {len(main_v)} views "
           f"(all folders except pose_16):")
     print(f"  T_base_arm t = {np.round(T_arm[:3, 3] * 1000, 2)} mm")
     print(f"  scatter: median {np.median(sc):.3f}  p90 "

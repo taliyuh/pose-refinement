@@ -172,7 +172,7 @@ def solve(views, use_offset=True, huber=0.003, fixed_dtheta=None,
     vp = np.array([pidx[v[0]] for v in views])
 
     # seed from the MODEL FK so the seed lives in the same frame as the fit
-    TB = np.array([K.ur5_fk(t) for t in TH])
+    TB = np.array([K.fk(t) for t in TH])
     R_x, t_x = calibrate_hand_eye_park([T[:3, :3] for T in TB],
                                        [T[:3, 3] for T in TB],
                                        [T[:3, :3] for T in TC],
@@ -223,7 +223,7 @@ def solve(views, use_offset=True, huber=0.003, fixed_dtheta=None,
         out = np.empty((len(views), 12))
         for i in range(len(views)):
             Xi = X if M is None else se3(*np.split(M @ F[i], 2)) @ X
-            A = K.ur5_fk(th[i]) @ Xi @ TC[i]
+            A = K.fk(th[i]) @ Xi @ TC[i]
             B = Bs[vp[i]]
             out[i] = ((CORNERS @ A[:3, :3].T + A[:3, 3])
                       - (CORNERS @ B[:3, :3].T + B[:3, 3])).ravel()

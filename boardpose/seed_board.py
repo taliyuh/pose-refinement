@@ -2,8 +2,8 @@
 """
 seed_board.py - marker-free board seed pose, from one image + its depth frame.
 
-Replaces the ArUco seeding in update_cached_views_all.py, which cannot work on
-the new captures for three independent reasons:
+Replaces the old ArUco seeding stage (removed), which cannot work on
+marker-free captures for three independent reasons:
 
   * pose_4..16 have no marker in frame at all;
   * it assumed a constant marker->board offset, but that offset moves between
@@ -39,8 +39,8 @@ ranked wood grain above the board (measured: it moved pose_16 from 0.46 px to
 1.20 px purely by reranking candidates).
 
 The search is only 3-DoF. Roll, pitch and height come from the depth table
-plane, fitted over the WHOLE image. That distinction matters: fit_dense_on_table
-picked its depth ROI by projecting the seed pose, so a bad seed produced a plane
+plane, fitted over the WHOLE image. That distinction matters: the old on-table
+fitter picked its depth ROI by projecting the seed pose, so a bad seed produced a plane
 fitted in the wrong place and the 3-DoF fit could never recover -- a +-150 mm
 in-plane search on such a plane still stalled at 1.52 px, versus 0.46 px once
 the plane was right. Nothing here depends on a prior pose.
@@ -64,7 +64,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(HERE))
 
 import board_model  # noqa: E402
-from tilt_vs_depth import K_4K  # noqa: E402
+from camera import K_4K  # noqa: E402
 
 D_4K = np.array([0.07524467259645462, -0.10655965656042099,
                  -0.00023194379173219204, 0.00031730238697491586,

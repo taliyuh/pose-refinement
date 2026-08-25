@@ -18,7 +18,7 @@ checkerboard, which is what removes the systematic bias that no amount of
 per-view fitting can reach. The current K_4K is exactly 3x the 720p matrix,
 i.e. it was rescaled rather than recalibrated -- this checks it.
 
-Two other things change versus fit_dense_on_table:
+Two other things change versus the old on-table fitter:
 
   * tilt is FREE here. The table constraint was needed because 4 corners cannot
     see tilt; 1184 subpixel points over a 320 x 250 mm board at 37 deg angular
@@ -55,11 +55,9 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(ROOT / "refinement_proposal"))
 
 import board_model  # noqa: E402
-from tilt_vs_depth import K_4K  # noqa: E402
-from fit_dense_on_table import D_4K, edge_search  # noqa: E402
+from camera import K_4K, D_4K, edge_search  # noqa: E402
 
 NINTR = 9
 NBIAS = board_model.NBIAS

@@ -13,45 +13,41 @@ Thumbs.db
 *~
 
 # ---------------------------------------------------------------- data
-# Captures: 2.6 GB of 4K colour+depth frames. These are the measurements, not
-# the code, and they do not belong in git.
+# Captures: 4K colour+depth frames. These are the measurements, not the code,
+# and they do not belong in git.
 images/
-synthetic_dataset/
 
 # ------------------------------------------------------------ third party
-# Vendored GLU-Net checkout: its own git repo, plus 450 MB of pretrained
-# weights. Nothing in the current pipeline uses it -- seed_board.py replaced
-# the GLU-Net seeding stage. Clone it separately if you need the old path.
+# Leftover local checkouts from the removed GLU-Net path. Nothing in the
+# pipeline imports them; delete the directories whenever you like.
 glunet_src/
+synthetic_dataset/
 
 # ---------------------------------------------------------- rendered output
-# Overlay and debug renders, ~1.2 GB of PNGs, all regenerable with
-#   render_fit.py --src out/bundle_rims6_v3.json --outdir out_overlays6_v2
-out_overlays/
-out_overlays6/
-out_overlays6_v2/
+# Overlay and debug renders, all regenerable with
+#   render_fit.py --src out/bundle.json --outdir out_overlays
+out_overlays*/
 out_annotated/
-out_debug_pose2/
-refinement_proposal/out/
-results/
-glunet_pose_refinement2/results/
-glunet_pose_refinement2/results_board_vs_camera/
+out_debug*/
+results*/
+boardpose/results*/
 
 # ------------------------------------------------------ pipeline artefacts
 # out/ mixes throwaway renders with the small calibration files the pipeline
 # actually consumes. Exclude the CONTENTS (out/* -- not out/, or git will not
 # descend into the directory and the negations below are silently ignored),
-# then re-admit the artefacts worth versioning.
-glunet_pose_refinement2/out/*
-!glunet_pose_refinement2/out/rims6_v2.json
-!glunet_pose_refinement2/out/bundle_rims6_v3.json
-!glunet_pose_refinement2/out/bundle_rims6_v3_nobias.json
-!glunet_pose_refinement2/out/kinematic_calib_v3.json
-!glunet_pose_refinement2/out/kinematic_calib_v3_nobias.json
-!glunet_pose_refinement2/out/cached_views.json
-!glunet_pose_refinement2/out/eval_multiview.json
-!glunet_pose_refinement2/out/eval_multiview_sweep.json
-!glunet_pose_refinement2/out/wrist_flex_test.json
+# then re-admit the reference artefacts worth versioning.
+#
+# What stays in git is only what a new user needs as a STARTING POINT:
+#   bundle_rims6_v3.json   refined intrinsics + rim bias (a camera property)
+#   kinematic_calib_v3.json  joint offsets + hand-eye (a robot property)
+#   eval_multiview.json    the published precision numbers, so a regression
+#                          in a fork is visible without re-running everything
+# Your own runs overwrite these; that is intended. See docs/METHOD.md.
+boardpose/out/*
+!boardpose/out/bundle_rims6_v3.json
+!boardpose/out/kinematic_calib_v3.json
+!boardpose/out/eval_multiview.json
 
 # Belt and braces: no bitmaps, archives or timestamped backups by any route.
 *.png

@@ -30,18 +30,28 @@ pixel-perfect over the board interior while placing the corners off the board
 entirely. Mask quality and pose quality were decoupled by construction, which
 is why GLU-Net inlier counts never predicted accuracy.
 
+## Scope of this document
+
+This is the *why*: the derivation of each stage, the error budget, and the
+record of what was tried and rejected. For how to run the thing, see the
+[README](../README.md).
+
+Some sections below describe stages that have since been **removed** from the
+repository — the GLU-Net seeding, the ArUco path, the on-table 3-DoF fitter, and
+several rejected error models. They are kept because the *reasoning* is the
+point: each one records a plausible idea and the measurement that killed it, and
+that is considerably more useful than the code was. Where a script no longer
+exists it is marked **[removed]**.
+
 ## Prerequisites
 
-- `.venv` with `numpy scipy opencv-python trimesh`
-- Data at `images/images_depth/pose_{1,2,3}/<timestamp>/{color.png,depth.png,pose.txt}`
-- `out/cached_views.json` — per-view `T_cam_board` / `T_cam_marker` seeds from
-  the existing GLU-Net stage. Only used to initialise the search; its errors do
-  not propagate.
+- `.venv` per `requirements.txt`
+- Data at `images/images_depth/pose_N/<timestamp>/{color.png,depth.png,pose.txt,joints.json}`
 
 Run everything from the repository root:
 
 ```bash
-cd /path/to/board_pose_obtain
+cd /path/to/board_pose
 ```
 
 ## Pipeline
@@ -67,7 +77,7 @@ ros2 topic hz /wrist_camera/color/image_raw            # must hold ~15 Hz, no dr
 Then tune the lamps against a real frame before committing to a full session:
 
 ```bash
-.venv/bin/python glunet_pose_refinement2/tune_lighting.py --watch images/images_depth
+.venv/bin/python boardpose/tune_lighting.py --watch images/images_depth
 ```
 
 It scores clipping, rim contrast, azimuthal uniformity and pocket-floor level on
@@ -76,7 +86,7 @@ clipping at ≥ 254: a clipped rim has no gradient at all, so it is deleted rath
 than merely bright, and the previous 47 captures had 0.28–1.70% of pixels there.
 
 ```bash
-python3 glunet_pose_refinement2/capture_board_view.py --root images/images_depth --pose 4
+python3 boardpose/capture_board_view.py --root images/images_depth --pose 4
 ```
 
 Interactive: jog the arm, press ENTER, repeat. Leave it running between views —
@@ -108,8 +118,8 @@ Existing captures are fixed exactly — these are static URDF transforms, not a
 fit — with:
 
 ```bash
-.venv/bin/python glunet_pose_refinement2/normalize_frames.py          # dry run
-.venv/bin/python glunet_pose_refinement2/normalize_frames.py --apply  # rewrite
+.venv/bin/python boardpose/normalize_frames.py          # dry run
+.venv/bin/python boardpose/normalize_frames.py --apply  # rewrite
 ```
 
 Originals are kept as `pose_raw.txt`, the applied transform is recorded in
@@ -169,8 +179,8 @@ camera_info  fx 2251.95  fy 2251.76  cx 1931.43  cy 1091.68
              D [0.0752, -0.1066, -0.0002, 0.0003, 0.0449]
 ```
 
-Those intrinsics are exactly `K_4K` / `D_4K` as hardcoded in `tilt_vs_depth.py`
-and `fit_dense_on_table.py`, which confirms the profile is the one the existing
+Those intrinsics are exactly `K_4K` / `D_4K` as hardcoded in
+`boardpose/camera.py`, which confirms the profile is the one the existing
 47 views were shot on.
 
 **Exposure is calibrated, not guessed.** At gain 0 against the four lamps:
@@ -224,35 +234,34 @@ a rim lit brightly on one side has its gradient peak pulled that way, which is a
 directional bias no rigid pose can absorb, and is the likely source of the
 −0.3…−0.8 px mean residual present in every view.
 
-### 1. Table plane and tilt audit  (~2 min)
+### 1. Table plane and tilt audit  **[removed: `tilt_vs_depth.py`]**
 
-```bash
-.venv/bin/python glunet_pose_refinement2/tilt_vs_depth.py
-```
+Fitted the table plane from depth in a ring **around** the board (the board is
+transparent, so its own depth is useless) and compared it to each board pose.
+Only the plane normal was used, never the offset — a depth scale error maps a
+plane to a parallel plane, so it cannot corrupt direction.
 
-Fits the table plane from depth in a ring **around** the board (the board is
-transparent, so its own depth is useless) and compares it to each cached board
-pose. Only the plane normal is used, never the offset — a depth scale error maps
-a plane to a parallel plane, so it cannot corrupt direction.
+This is the diagnostic that exposed the 5–51° tilt errors, and so the reason the
+rest of this pipeline exists. It is gone because tilt no longer comes from
+depth: the two-level rim model triangulates it from the image (step 4 onward),
+and the depth normal is 0.66° off, which is no longer accurate enough to check
+against. The intrinsics it carried now live in `boardpose/camera.py`.
 
-Writes `out/tilt_vs_depth.json`. This is what exposes the 5–51° tilt errors.
+### 2. Optional diagnostics  **[removed: `check_flip.py`, `solve_on_table.py`]**
 
-### 2. Optional diagnostics
+`check_flip.py` confirmed the large tilts were *not* the planar-PnP two-solution
+ambiguity (only 4/67 took the wrong branch). `solve_on_table.py` re-solved from
+the cached corners with tilt locked to the table; its residual was the first
+working quality gate (board-height scatter 25 mm → 1.2 mm).
 
-```bash
-.venv/bin/python glunet_pose_refinement2/check_flip.py      # planar PnP ambiguity
-.venv/bin/python glunet_pose_refinement2/solve_on_table.py  # 4-DoF fit to cached corners
-```
-
-`check_flip.py` confirms the large tilts are *not* the two-solution ambiguity
-(only 4/67 took the wrong branch). `solve_on_table.py` re-solves from the cached
-corners with tilt locked to the table; its residual was the first working
-quality gate (board-height scatter 25 mm → 1.2 mm).
+Both operated on the old 4-corner cached poses, which no longer exist. The
+surviving descendant of the flip check is `flip_recover.py`, which detects and
+*repairs* 180° yaw flips in the current rim fits.
 
 ### 3. Inspect the model features
 
 ```bash
-.venv/bin/python glunet_pose_refinement2/board_model.py
+.venv/bin/python boardpose/board_model.py
 ```
 
 Extracts from the STL (which is in **centimetres**: 320 × 250 × 25 mm):
@@ -265,29 +274,36 @@ Extracts from the STL (which is in **centimetres**: 320 × 250 × 25 mm):
 The outer rectangle is deliberately excluded: 25 mm of transparent acrylic makes
 it a double edge (top and bottom faces up to 16 px apart at 4K).
 
-### 4. Dense per-view fit  (~3 min)
+### 4. Per-view rim fit  (~3 min)
 
 ```bash
-# pass 1 — solve the board height too, to calibrate it per folder
-.venv/bin/python glunet_pose_refinement2/fit_dense_on_table.py --free-h
-
-# pass 2 — lock the height, true 3-DoF (yaw, x, y) on the table
-.venv/bin/python glunet_pose_refinement2/fit_dense_on_table.py \
-    --h-from glunet_pose_refinement2/out/dense_on_table.json \
-    --out glunet_pose_refinement2/out/dense_3dof.json
+.venv/bin/python boardpose/fit_rims6.py --out boardpose/out/rims6.json
 ```
 
-Roll, pitch and height come from the depth table plane; the image determines
-only yaw, x, y. Writes `out/dense_on_table.json` and `out/dense_3dof.json`.
+Full 6-DoF, seeded per image by `seed_board.py` from the image and its depth
+frame alone — no marker, no cached pose. Each of the top-20 seed candidates is
+refined and the winner chosen on the **rim residual**, the quantity actually
+being minimised, rather than on the chamfer score that ranked them.
 
 Quality gate: `mad_px < 1.0`. This replaces every heuristic mask-quality metric —
-those all sat at chance (AUC 0.55) because they scored the mask, not the pose.
+those all sat at chance (AUC 0.52–0.55) because they scored the mask, not the
+pose.
+
+> **Superseded: `fit_dense_on_table.py` [removed].** It solved only yaw, u, v,
+> taking roll, pitch and height from a depth plane whose ROI came from the seed
+> pose — so a wrong seed produced a plane fitted in the wrong place and no
+> in-plane search could recover. Measured on `pose_12/131731_390724`: widening
+> the search from ±30 mm to ±150 mm with full 360° yaw moved the residual only
+> 1.72 → 1.52 px, while freeing all 6 DoF reached 0.46 px. The table constraint
+> was a workaround for 4-corner PnP being blind to tilt; 1184 subpixel points
+> over two contour levels are not, so the constraint bought nothing and cost the
+> dependency on depth.
 
 ### 5. Bundle adjustment  (~70 s)
 
 ```bash
-.venv/bin/python glunet_pose_refinement2/bundle_rims.py \
-    --out glunet_pose_refinement2/out/bundle_2level.json
+.venv/bin/python boardpose/bundle_rims.py \
+    --out boardpose/out/bundle_2level.json
 ```
 
 **This is the estimator.** Joint solve over all views:
@@ -313,7 +329,7 @@ Writes `out/bundle_2level.json` (refined intrinsics + per-view `T_cam_board`).
 ### 6. Visual check
 
 ```bash
-.venv/bin/python glunet_pose_refinement2/render_fit.py
+.venv/bin/python boardpose/render_fit.py
 ```
 
 Writes 47 panels to `out_overlays/`. Left: full frame with green top rims, cyan
@@ -327,7 +343,7 @@ pixel-perfect and its 4-corner pose was 18.8° out.
 ### 7. Hand-eye calibration from the board  (~20 s)
 
 ```bash
-.venv/bin/python glunet_pose_refinement2/handeye_board.py
+.venv/bin/python boardpose/handeye_board.py
 ```
 
 Solves `T_base_tcp(i) @ X @ T_cam_board(i) = T_base_board(p)` for the hand-eye
@@ -344,9 +360,9 @@ Result: `X` translation `[+32.5, -470.2, +320.2] mm`, `|t|` = 570 mm — which
 matches the physical stick length. Also writes `out/handeye.json`.
 
 **No deflection model is offered here.** Three have now been tried and all
-three are rejected — see also `test_wrist_flex.py`, which rejected the third
-with a placebo control after leave-one-folder-out had passed it 11/11. The
-first two are deleted; `handeye_board.py` keeps the post-mortem as a comment so they are not
+three are rejected — see step 8b, which rejected the third with a placebo
+control after leave-one-folder-out had passed it 11/11. All three are deleted;
+`handeye_board.py` keeps the post-mortem as a comment so they are not
 reinvented. `--flex` bought 11% for 18 parameters and moved `X` by 22 mm.
 **droop** rotated the FK output about a horizontal axis through the shoulder by
 an angle proportional to reach — the actual physics in one parameter — and gave
@@ -428,7 +444,7 @@ Same failure mode as flex/droop. `--rim-bias none` restores the old model.
 ### 9. Board pose from N shots  (~2 min for 15 views)
 
 ```bash
-.venv/bin/python glunet_pose_refinement2/fit_board_multiview.py --pose 12 --split-half
+.venv/bin/python boardpose/fit_board_multiview.py --pose 12 --split-half
 ```
 
 The production estimator when you have several captures of one static board.
@@ -465,19 +481,15 @@ Also gates on `--max-radius` (default 500 px): views whose board sits far off
 the principal point carry ~8× the tilt error, and `mad_px` does not catch them.
 
 ```bash
-.venv/bin/python glunet_pose_refinement2/eval_multiview.py           # every folder
-.venv/bin/python glunet_pose_refinement2/eval_multiview.py --sweep   # scan chain-sigma
+.venv/bin/python boardpose/eval_multiview.py           # every folder
+.venv/bin/python boardpose/eval_multiview.py --sweep   # scan chain-sigma
 ```
 
 Split-half over the *views*: fit two disjoint halves independently, compare.
 The board never moved, so the disagreement is the error, doubled — and both
 estimators see the same views, so it is a comparison of models, not of data.
 
-### 8b. Configuration-dependent hand-eye — tested, rejected
-
-```bash
-.venv/bin/python glunet_pose_refinement2/test_wrist_flex.py
-```
+### 8b. Configuration-dependent hand-eye — tested, rejected  **[removed: `test_wrist_flex.py`]**
 
 After the rim-bias fix, `theta_6` became the strongest predictor of the leftover
 residual (+0.337, against 0.15 for everything else), suggesting a hand-eye that
@@ -514,15 +526,19 @@ as the amplitude prior is loosened (0.1 mm → 0.624, 0.3 → 0.543, 1.0 → 0.4
 ### 8. Validation (no ground truth used)
 
 ```bash
-.venv/bin/python glunet_pose_refinement2/split_half.py       # in-plane precision
-.venv/bin/python glunet_pose_refinement2/tilt_precision.py   # tilt precision, 1-plane vs 2-level
-.venv/bin/python glunet_pose_refinement2/eval_consistency.py # cross-view consistency
+.venv/bin/python boardpose/tilt_precision.py   # tilt precision, 1-plane vs 2-level
+.venv/bin/python boardpose/eval_multiview.py   # end-to-end split-half, all folders
 ```
 
-`split_half.py` and `tilt_precision.py` fit each view twice from disjoint halves
-of the pockets and compare — pure internal precision, nothing external can
-flatter it. `eval_consistency.py` checks that `T_marker_board` is constant within
-a folder, since board and marker are both static.
+`tilt_precision.py` fits each view twice from disjoint halves of the pockets and
+compares — pure internal precision, nothing external can flatter it.
+`eval_multiview.py` does the same thing one level up, over disjoint halves of
+the *views*, which is the honest end-to-end number quoted at the top.
+
+**[removed]** `split_half.py` measured in-plane precision the same way on the old
+on-table 3-DoF fits; `eval_consistency.py` checked that `T_marker_board` was
+constant within a folder. Both were tied to stages that no longer exist — the
+first to the on-table fitter, the second to the ArUco marker.
 
 The probed ground truth in `ground_truth.txt` is accurate to only ~1.5–2.5 mm
 (side lengths come out 315–323 mm against 320 nominal), so it can confirm a fix
@@ -555,9 +571,35 @@ but cannot certify 0.2 mm. Do not tune against it.
 
 ## Removed
 
-- `score_views.py`, `eval_metrics.py`, `eval_photometric.py` — failed
-  mask-quality metrics, all at chance (AUC 0.52–0.55). Deleted; archived in
-  `out/removed_20260812.tar.gz`.
+Kept as a list so none of it gets reinvented.
+
+**Failed models.** Each surviving file keeps a comment saying what was tried and
+why it failed, which is the only part worth having.
+
+- `score_views.py`, `eval_metrics.py`, `eval_photometric.py` — heuristic
+  mask-quality metrics, all at chance (AUC 0.52–0.55). They scored the mask, not
+  the pose; the rim residual replaced all of them.
 - `handeye_board.py --flex` / **droop**, and the compliance term in
-  `kinematic_calib.py` — see step 7 and step 6. Each file keeps a comment
-  saying what was tried and why it failed, which is the only part worth having.
+  `kinematic_calib.py` — see steps 6 and 7.
+- Configuration-dependent hand-eye — see step 8b, and run the placebo.
+- `--rim-bias b0b1` and `b0sym` — see step 6b. Better pixel residual, worse pose.
+
+**Superseded stages**, removed when the repository was prepared for release.
+The reasoning for each is in the step above that describes it.
+
+| removed | replaced by |
+|---|---|
+| GLU-Net dense matching + 4-corner PnP (`estimate_glunet.py`, `run_refinement_all.py`, `glunet_src/`) | `fit_rims6.py` — direct rim fitting |
+| GTSAM factor graph (`solve_poses_gtsam.py`, `run_depth_refinement.py`) | `bundle_rims.py` — sparse bundle adjustment |
+| ArUco seeding (`update_cached_views_all.py`, `calib.py`, `aruco_localise.py`) | `seed_board.py` — marker-free, from image + depth |
+| on-table 3-DoF fit (`fit_dense_on_table.py`) | `fit_rims6.py` — full 6-DoF, tilt free |
+| depth tilt audit (`tilt_vs_depth.py`) | the two-level rim model; intrinsics moved to `camera.py` |
+| `check_flip.py`, `solve_on_table.py`, `split_half.py`, `eval_consistency.py` | `flip_recover.py`, `eval_multiview.py` |
+| `cached_views.json` and its maintenance scripts | `joints.json`, written at capture time |
+| BlenderProc synthetic data (`generate_data.py`) | never used by the metrology path |
+
+The one thing worth restating: **the GLU-Net stage was not slow or fragile, it
+was solving the wrong problem.** Reducing 50,000 dense matches to 4 coplanar
+corners throws away exactly the information that constrains tilt, and no amount
+of match quality can put it back. Mask quality and pose quality were decoupled
+by construction.

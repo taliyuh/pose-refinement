@@ -88,7 +88,7 @@ WHAT IS HELD FIXED, AND WHY
                identifiable per folder provided the wrist actually rotated
                between views, which `--refine-x` checks before allowing it.
 
-The fit runs in the FK frame (ur5_fk(theta), no base mounting transform), for
+The fit runs in the FK frame (kinematics.fk(theta), no base mounting transform), for
 the reason kinematic_calib.py gives: the mounting transform is a constant
 left-multiplication, absorbed exactly by the board pose. It is put back at the
 end, from this folder's own captures, so the reported pose is in the frame the
@@ -170,7 +170,7 @@ def load(pose, bundle, dtheta, data, max_radius, quiet=False):
         m.ox, m.oy = x0, y0
         m.rvec, m.tvec = rvec, tvec
         m.theta = joints[(p, v)]
-        m.T_fk = K.ur5_fk(m.theta + dtheta)
+        m.T_fk = K.fk(m.theta + dtheta)
         m.seed = T
         m.radius_px, m.n_seed = rad, int(r["n"])
         out.append(m)
