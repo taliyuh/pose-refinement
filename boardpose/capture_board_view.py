@@ -197,12 +197,15 @@ class BoardCaptureNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
     def _color_cb(self, msg):
+        # Broad on purpose: an exception escaping a ROS callback tears down the
+        # executor and ends the session. Logged, never swallowed.
         try:
             self.color = (stamp_sec(msg), time.time(), decode_color(msg))
         except Exception as e:
             self.get_logger().error(f"colour decode: {e}")
 
     def _depth_cb(self, msg):
+        # Broad on purpose; see _color_cb.
         try:
             self.depth = (stamp_sec(msg), time.time(), decode_depth(msg))
         except Exception as e:
@@ -244,6 +247,9 @@ class BoardCaptureNode(Node):
                     frame, self.ee_link, rclpy.time.Time(),
                     timeout=rclpy.duration.Duration(seconds=0.05))
             except Exception:
+                # Probing: this frame is simply not in the tree. Not silent --
+                # if no frame answers we return None and wait_ready() reports
+                # "TF" as a missing stream before any capture is taken.
                 continue
             self.planning_frame = frame
             t, q = tr.transform.translation, tr.transform.rotation
@@ -252,17 +258,26 @@ class BoardCaptureNode(Node):
         return None
 
 
+def _missing_streams(need):
+    """Names of the required streams that have not produced a message yet."""
+    missing = []
+    for name, have_it in need.items():
+        if not have_it():
+            missing.append(name)
+    return missing
+
+
 def wait_ready(node, timeout=15.0):
     """Block until every required stream has produced at least one message."""
     deadline = time.time() + timeout
     need = {"colour": lambda: node.color, "depth": lambda: node.depth,
             "joint states": lambda: node.joints, "TF": node.tcp_pose}
     while time.time() < deadline:
-        missing = [k for k, f in need.items() if not f()]
+        missing = _missing_streams(need)
         if not missing:
             return []
         time.sleep(0.2)
-    return [k for k, f in need.items() if not f()]
+    return _missing_streams(need)
 
 
 def observe(node, settle, window, t_press):
@@ -425,6 +440,161 @@ def coverage(root):
           "  from hand-eye error). Neither is visible in the numbers above.")
 
 
+END_OF_INPUT = object()
+STOP = object()
+
+
+def read_command(pose_idx, count):
+    """The operator's next command, or END_OF_INPUT when stdin closes."""
+    try:
+        return input(f"\n[pose_{pose_idx}] {count} captured > ").strip()
+    except EOFError:
+        return END_OF_INPUT
+
+
+def check_focus(rise_px, focus_hist):
+    """Warning text for this frame's focus, or "" if it looks fine.
+
+    Judged against THIS session, not an absolute number: the rise width shifts
+    with the OpenCV build (4.6 and 4.14 differ by ~0.35 px on the same frame,
+    via different Hough circles) and with standoff, so a hardcoded threshold
+    produces false alarms.
+
+    Appends to `focus_hist`, which is the running baseline it judges against.
+    """
+    if not np.isfinite(rise_px):
+        return ("no rims found, so focus could not be measured -- "
+                "board out of frame, or too oblique")
+
+    warning = ""
+    if len(focus_hist) >= 4:
+        median_px = float(np.median(focus_hist))
+        if rise_px > 1.25 * median_px:
+            warning = (f"SOFT: rim rise {rise_px:.2f} px vs {median_px:.2f} "
+                       "median for this session -- defocused or motion blurred")
+    focus_hist.append(rise_px)
+    return warning
+
+
+def delete_capture(capture_dir):
+    """Remove the last capture; True if one was actually deleted."""
+    if capture_dir is None:
+        print("  nothing to delete")
+        return False
+    for entry in capture_dir.iterdir():
+        entry.unlink()
+    capture_dir.rmdir()
+    print(f"  deleted {capture_dir}")
+    return True
+
+
+def parse_pose_command(cmd, current_pose):
+    """`p <n>` -- the new pose index, or the current one if the input is bad."""
+    parts = cmd.split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        print("  usage: p <n>")
+        return current_pose
+
+    pose_idx = int(parts[1])
+    print(f"  now writing to pose_{pose_idx} -- move the board, and "
+          f"keep it dead still for every view in this set")
+    return pose_idx
+
+
+class CaptureSession:
+    """The operator REPL: one capture per ENTER, plus the editing commands.
+
+    `count` stays readable after run() returns so the caller can report and run
+    coverage() even when the session ended on Ctrl-C.
+    """
+
+    def __init__(self, node, args, topics):
+        self.node = node
+        self.args = args
+        self.topics = topics
+        self.pose_idx = args.pose
+        self.last = None
+        self.count = 0
+        self.focus_hist = []
+
+    def run(self):
+        try:
+            while rclpy.ok():
+                if self.step() is STOP:
+                    break
+        except KeyboardInterrupt:
+            print()           # Ctrl-C is the intended way to end a session
+
+    def step(self):
+        """One command, or one capture. Returns STOP to end the session."""
+        cmd = self.next_command()
+        if cmd is STOP:
+            return STOP
+        if cmd is not None:
+            return self.run_command(cmd)
+        return self.capture_one()
+
+    def next_command(self):
+        """STOP to end, None to capture, otherwise the command text."""
+        if self.args.once:
+            return None
+        cmd = read_command(self.pose_idx, self.count)
+        if cmd is END_OF_INPUT:
+            return STOP
+        return cmd or None
+
+    def run_command(self, cmd):
+        if cmd == "q":
+            return STOP
+        if cmd == "s":
+            coverage(self.args.root)
+            return None
+        if cmd == "d":
+            if delete_capture(self.last):
+                self.last = None
+                self.count -= 1
+            return None
+        if cmd.startswith("p "):
+            self.pose_idx = parse_pose_command(cmd, self.pose_idx)
+            return None
+        print(f"  unknown command {cmd!r}")
+        return None
+
+    def capture_one(self):
+        args = self.args
+        t_press = time.time()
+        print(f"  settling {args.settle:.1f}s, watching {args.window:.1f}s ...")
+        sample, motion = observe(self.node, args.settle, args.window, t_press)
+        if sample is None:
+            print(f"  FAILED: {motion}")
+            return STOP if args.once else None
+
+        saved_dir, sharp, foc = save(args.root, self.pose_idx, sample, motion,
+                                     self.topics, self.node.info, args.ee_link)
+        self.last = saved_dir
+        self.count += 1
+        self.report(saved_dir, motion, sharp, foc)
+        return STOP if args.once else None
+
+    def report(self, saved_dir, motion, sharp, foc):
+        flags = []
+        if motion["tcp_range_mm"] > self.args.max_tcp_motion_mm:
+            flags.append(f"TCP MOVED {motion['tcp_range_mm']:.2f} mm while watching")
+        if motion["joint_speed_max"] > 1e-3:
+            flags.append(f"joints still moving ({motion['joint_speed_max']:.4f} rad/s)")
+
+        print(f"  saved {saved_dir}")
+        print(f"    tcp drift {motion['tcp_range_mm']:.3f} mm | image rms "
+              f"{motion['image_rms_levels']:.2f} levels | "
+              f"focus {foc:.2f} px rise | sharpness {sharp:.0f} (clutter)")
+
+        focus_warning = check_focus(foc, self.focus_hist)
+        if focus_warning:
+            flags.append(focus_warning)
+        for flag in flags:
+            print(f"    WARNING: {flag} -- consider 'd' and a longer --settle")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -493,90 +663,13 @@ def main():
     print("  [ENTER] capture   p <n> switch board position   d delete last   "
           "s coverage   q quit")
 
-    pose_idx, last, count = args.pose, None, 0
-    focus_hist = []
+    session = CaptureSession(node, args, topics)
     try:
-        while rclpy.ok():
-            if args.once:
-                cmd = ""
-            else:
-                try:
-                    cmd = input(f"\n[pose_{pose_idx}] {count} captured > ").strip()
-                except EOFError:
-                    break
-            if cmd == "q":
-                break
-            if cmd == "s":
-                coverage(args.root); continue
-            if cmd == "d":
-                if last is None:
-                    print("  nothing to delete")
-                else:
-                    for f in last.iterdir():
-                        f.unlink()
-                    last.rmdir()
-                    print(f"  deleted {last}")
-                    last, count = None, count - 1
-                continue
-            if cmd.startswith("p "):
-                try:
-                    pose_idx = int(cmd.split()[1])
-                    print(f"  now writing to pose_{pose_idx} -- move the board, and "
-                          f"keep it dead still for every view in this set")
-                except (ValueError, IndexError):
-                    print("  usage: p <n>")
-                continue
-            if cmd:
-                print(f"  unknown command {cmd!r}")
-                continue
-
-            t_press = time.time()
-            print(f"  settling {args.settle:.1f}s, watching {args.window:.1f}s ...")
-            sample, motion = observe(node, args.settle, args.window, t_press)
-            if sample is None:
-                print(f"  FAILED: {motion}")
-                if args.once:
-                    break
-                continue
-
-            d, sharp, foc = save(args.root, pose_idx, sample, motion, topics,
-                                 node.info, args.ee_link)
-            last, count = d, count + 1
-            flags = []
-            if motion["tcp_range_mm"] > args.max_tcp_motion_mm:
-                flags.append(f"TCP MOVED {motion['tcp_range_mm']:.2f} mm while watching")
-            if motion["joint_speed_max"] > 1e-3:
-                flags.append(f"joints still moving ({motion['joint_speed_max']:.4f} rad/s)")
-            print(f"  saved {d}")
-            print(f"    tcp drift {motion['tcp_range_mm']:.3f} mm | image rms "
-                  f"{motion['image_rms_levels']:.2f} levels | "
-                  f"focus {foc:.2f} px rise | sharpness {sharp:.0f} (clutter)")
-            # Judge focus against THIS session, not an absolute number. The rise
-            # width shifts with the OpenCV build (4.6 and 4.14 differ by ~0.35 px
-            # on the same frame, via different Hough circles) and with standoff,
-            # so a hardcoded threshold produces false alarms. A frame well above
-            # the running median of its own session is the real signal.
-            if np.isfinite(foc):
-                if len(focus_hist) >= 4:
-                    med = float(np.median(focus_hist))
-                    if foc > 1.25 * med:
-                        flags.append(f"SOFT: rim rise {foc:.2f} px vs {med:.2f} "
-                                     "median for this session -- defocused or "
-                                     "motion blurred")
-                focus_hist.append(foc)
-            else:
-                flags.append("no rims found, so focus could not be measured -- "
-                             "board out of frame, or too oblique")
-            for f in flags:
-                print(f"    WARNING: {f} -- consider 'd' and a longer --settle")
-            if args.once:
-                break
-    except KeyboardInterrupt:
-        pass
+        session.run()
     finally:
-        if count:
+        if session.count:
             coverage(args.root)
-        print(f"\n{count} views captured under {args.root}")
+        print(f"\n{session.count} views captured under {args.root}")
         executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()

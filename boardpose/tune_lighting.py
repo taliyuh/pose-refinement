@@ -128,16 +128,28 @@ def refine(gray, cx, cy, r):
     step, span = 4.0, 0.35
     best = (cx, cy, r, strength(cx, cy, r))
     for _ in range(3):
-        for rr in r * np.linspace(1 - span, 1 + span, 13):
-            for dx in (-step, 0.0, step):
-                for dy in (-step, 0.0, step):
-                    v = strength(cx + dx, cy + dy, rr)
-                    if v > best[3]:
-                        best = (cx + dx, cy + dy, rr, v)
+        for radius in r * np.linspace(1 - span, 1 + span, 13):
+            best = _best_nearby_centre(strength, cx, cy, radius, step, best)
         cx, cy, r = best[:3]
         step *= 0.45
         span *= 0.45
-    return best if best[3] >= 3.0 else None
+
+    if best[3] < MIN_RIM_STRENGTH:
+        return None
+    return best
+
+
+MIN_RIM_STRENGTH = 3.0
+
+
+def _best_nearby_centre(strength, cx, cy, radius, step, best):
+    """Best of the 3x3 centre offsets at one radius, against `best` so far."""
+    for dx in (-step, 0.0, step):
+        for dy in (-step, 0.0, step):
+            score = strength(cx + dx, cy + dy, radius)
+            if score > best[3]:
+                best = (cx + dx, cy + dy, radius, score)
+    return best
 
 
 def rim_profile(gray, cx, cy, r, nsect=16, nrad=21, half=0.28):
@@ -235,9 +247,15 @@ def focus(gray, circles=None):
     """
     if circles is None:
         circles = candidates(gray, cap=24)
-    vals = [rise_width(gray, cx, cy, r) for cx, cy, r in circles]
-    vals = [v for v in vals if np.isfinite(v)]
-    return float(np.median(vals)) if vals else float("nan")
+    widths = []
+    for cx, cy, r in circles:
+        width = rise_width(gray, cx, cy, r)
+        if np.isfinite(width):
+            widths.append(width)
+
+    if not widths:
+        return float("nan")
+    return float(np.median(widths))
 
 
 def score(path, verbose=True):

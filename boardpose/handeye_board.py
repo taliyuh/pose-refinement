@@ -60,6 +60,31 @@ def unse3(T):
     return np.concatenate([cv2.Rodrigues(T[:3, :3])[0].ravel(), T[:3, 3]])
 
 
+def board_corners(T):
+    """The four board corners mapped through T."""
+    return CORNERS @ T[:3, :3].T + T[:3, 3]
+
+
+def corner_spread_mm(delta):
+    """(rms, max) corner displacement in mm, from a 4x3 corner difference."""
+    return (float(np.sqrt((delta ** 2).sum(1).mean()) * 1000),
+            float(np.linalg.norm(delta, axis=1).max() * 1000))
+
+
+def average_pose(poses):
+    """Nearest-rotation average with a median translation, so one bad view
+    shifts the result by a bounded amount instead of dragging the mean."""
+    averaged = np.eye(4)
+    U, _, Vt = np.linalg.svd(sum(T[:3, :3] for T in poses))
+    averaged[:3, :3] = U @ Vt
+    if np.linalg.det(averaged[:3, :3]) < 0:
+        # SVD gave a reflection; flip the least-significant axis back.
+        U[:, -1] *= -1
+        averaged[:3, :3] = U @ Vt
+    averaged[:3, 3] = np.median([T[:3, 3] for T in poses], axis=0)
+    return averaged
+
+
 def calibrate_hand_eye_park(R_g, t_g, R_t, t_t):
     """Closed-form AX = XB (Park & Martin 1994), returning X = T_tcp_cam.
 
@@ -71,47 +96,77 @@ def calibrate_hand_eye_park(R_g, t_g, R_t, t_t):
 
     Inputs match the cv2 signature: gripper-to-base and target-to-camera poses.
     """
-    n = len(R_g)
-    A, B = [], []
-    for i in range(n - 1):
-        for j in (i + 1,):
-            Ta = np.eye(4); Ta[:3, :3] = R_g[j].T @ R_g[i]
-            Ta[:3, 3] = R_g[j].T @ (t_g[i] - t_g[j])
-            Tb = np.eye(4); Tb[:3, :3] = R_t[j] @ R_t[i].T
-            Tb[:3, 3] = t_t[j] - Tb[:3, :3] @ t_t[i]
-            if np.linalg.norm(cv2.Rodrigues(Ta[:3, :3])[0]) < 1e-3:
-                continue          # a pure translation constrains no rotation
-            A.append(Ta); B.append(Tb)
-    if len(A) < 2:
+    gripper_motions, target_motions = _consecutive_motions(R_g, t_g, R_t, t_t)
+    if len(gripper_motions) < 2:
         raise RuntimeError("hand-eye needs >=2 motions with real rotation")
 
-    M = np.zeros((3, 3))
-    for Ta, Tb in zip(A, B):
-        al = cv2.Rodrigues(Ta[:3, :3])[0].ravel()
-        be = cv2.Rodrigues(Tb[:3, :3])[0].ravel()
-        M += np.outer(be, al)
-    w, V = np.linalg.eigh(M.T @ M)
-    R_x = V @ np.diag(1.0 / np.sqrt(np.maximum(w, 1e-12))) @ V.T @ M.T
+    R_x = _park_rotation(gripper_motions, target_motions)
+    t_x = _park_translation(gripper_motions, target_motions, R_x)
+    return R_x, t_x
+
+
+def _consecutive_motions(R_g, t_g, R_t, t_t):
+    """Relative gripper and target motions between consecutive views."""
+    gripper_motions, target_motions = [], []
+    for i in range(len(R_g) - 1):
+        j = i + 1
+        gripper = np.eye(4)
+        gripper[:3, :3] = R_g[j].T @ R_g[i]
+        gripper[:3, 3] = R_g[j].T @ (t_g[i] - t_g[j])
+
+        target = np.eye(4)
+        target[:3, :3] = R_t[j] @ R_t[i].T
+        target[:3, 3] = t_t[j] - target[:3, :3] @ t_t[i]
+
+        if np.linalg.norm(cv2.Rodrigues(gripper[:3, :3])[0]) < 1e-3:
+            continue              # a pure translation constrains no rotation
+        gripper_motions.append(gripper)
+        target_motions.append(target)
+    return gripper_motions, target_motions
+
+
+def _park_rotation(gripper_motions, target_motions):
+    """R_x from the correlation of the two motions' rotation vectors."""
+    correlation = np.zeros((3, 3))
+    for gripper, target in zip(gripper_motions, target_motions):
+        gripper_axis = cv2.Rodrigues(gripper[:3, :3])[0].ravel()
+        target_axis = cv2.Rodrigues(target[:3, :3])[0].ravel()
+        correlation += np.outer(target_axis, gripper_axis)
+
+    eigenvalues, eigenvectors = np.linalg.eigh(correlation.T @ correlation)
+    inverse_sqrt = np.diag(1.0 / np.sqrt(np.maximum(eigenvalues, 1e-12)))
+    R_x = eigenvectors @ inverse_sqrt @ eigenvectors.T @ correlation.T
+
     U, _, Vt = np.linalg.svd(R_x)          # re-orthonormalise
     R_x = U @ Vt
     if np.linalg.det(R_x) < 0:
-        U[:, -1] *= -1; R_x = U @ Vt
+        U[:, -1] *= -1
+        R_x = U @ Vt
+    return R_x
 
-    C, d = [], []
-    for Ta, Tb in zip(A, B):
-        C.append(Ta[:3, :3] - np.eye(3))
-        d.append(R_x @ Tb[:3, 3] - Ta[:3, 3])
-    t_x = np.linalg.lstsq(np.vstack(C), np.concatenate(d), rcond=None)[0]
-    return R_x, t_x
+
+def _park_translation(gripper_motions, target_motions, R_x):
+    """t_x from the linear system left once the rotation is known."""
+    left, right = [], []
+    for gripper, target in zip(gripper_motions, target_motions):
+        left.append(gripper[:3, :3] - np.eye(3))
+        right.append(R_x @ target[:3, 3] - gripper[:3, 3])
+    return np.linalg.lstsq(np.vstack(left), np.concatenate(right),
+                           rcond=None)[0]
 
 
 def kabsch(P, Q):
     """Rigid transform mapping P onto Q."""
-    cp, cq = P.mean(0), Q.mean(0)
-    U, _, Vt = np.linalg.svd((P - cp).T @ (Q - cq))
-    d = np.sign(np.linalg.det(Vt.T @ U.T))
-    R = Vt.T @ np.diag([1, 1, d]) @ U.T
-    T = np.eye(4); T[:3, :3] = R; T[:3, 3] = cq - R @ cp
+    source_centre, target_centre = P.mean(0), Q.mean(0)
+    U, _, Vt = np.linalg.svd((P - source_centre).T @ (Q - target_centre))
+
+    # Force a rotation rather than a reflection.
+    handedness = np.sign(np.linalg.det(Vt.T @ U.T))
+    R = Vt.T @ np.diag([1, 1, handedness]) @ U.T
+
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = target_centre - R @ source_centre
     return T
 
 
@@ -134,20 +189,100 @@ def gt_board_poses():
 
 def load(src, cache, key):
     """Views with both robot FK and a camera-frame target pose."""
-    views = []
     if key == "board":
-        for r in json.load(open(src))["views"]:
-            rec = cache[str(r["pose"])].get(r["view"])
-            if rec and rec.get("T_base_tcp"):
-                views.append((r["pose"], r["view"], np.asarray(rec["T_base_tcp"]),
-                              np.asarray(r["T_cam_board"])))
-    else:
-        for p in cache:
-            for v, rec in cache[p].items():
-                if rec.get("T_base_tcp") and rec.get("T_cam_marker"):
-                    views.append((int(p), v, np.asarray(rec["T_base_tcp"]),
-                                  np.asarray(rec["T_cam_marker"])))
+        return _load_board_views(src, cache)
+    return _load_marker_views(cache)
+
+
+def _load_board_views(src, cache):
+    """Board poses come from the bundle; the TCP pose from the cache."""
+    views = []
+    for record in json.load(open(src))["views"]:
+        cached = cache[str(record["pose"])].get(record["view"])
+        if not cached or not cached.get("T_base_tcp"):
+            continue
+        views.append((record["pose"], record["view"],
+                      np.asarray(cached["T_base_tcp"]),
+                      np.asarray(record["T_cam_board"])))
     return views
+
+
+def _load_marker_views(cache):
+    """The legacy ArUco path: both poses come from the cache."""
+    views = []
+    for pose in cache:
+        for view_name, cached in cache[pose].items():
+            if not cached.get("T_base_tcp") or not cached.get("T_cam_marker"):
+                continue
+            views.append((int(pose), view_name,
+                          np.asarray(cached["T_base_tcp"]),
+                          np.asarray(cached["T_cam_marker"])))
+    return views
+
+
+def _without_rejected(views, reject):
+    if not reject:
+        return views
+    kept = []
+    for view in views:
+        if (view[0], view[1]) not in reject:
+            kept.append(view)
+    return kept
+
+
+def _views_in_pose(views, pose):
+    """Captures belonging to one pose_N folder."""
+    selected = []
+    for view in views:
+        if view[0] == pose:
+            selected.append(view)
+    return selected
+
+
+def _pose_components(views):
+    """(gripper R, gripper t, target R, target t) as parallel lists."""
+    gripper_R, gripper_t, target_R, target_t = [], [], [], []
+    for _, _, T_base_tcp, T_cam_target in views:
+        gripper_R.append(T_base_tcp[:3, :3])
+        gripper_t.append(T_base_tcp[:3, 3])
+        target_R.append(T_cam_target[:3, :3])
+        target_t.append(T_cam_target[:3, 3])
+    return gripper_R, gripper_t, target_R, target_t
+
+
+def _seed_x_per_folder(views, poses, global_X):
+    """Per-folder X must be SEEDED per folder.
+
+    The closed form assumes one X for everything it is given, so seeding 16
+    folders from one global solve puts them all in the same wrong basin --
+    which is what happened: the mount changed between pose_3 and pose_4
+    (|t| 570 mm -> 133 mm), the global seed landed on the majority value, and
+    poses 1-3 were then rejected as outliers despite being the correct ones.
+    """
+    seeds = {}
+    for pose in poses:
+        in_folder = _views_in_pose(views, pose)
+        gripper_R, gripper_t, target_R, target_t = _pose_components(in_folder)
+        try:
+            R_x, t_x = calibrate_hand_eye_park(gripper_R, gripper_t,
+                                               target_R, target_t)
+        except RuntimeError:
+            seeds[pose] = global_X.copy()      # too few motions in this folder
+            continue
+        X_pose = np.eye(4)
+        X_pose[:3, :3] = R_x
+        X_pose[:3, 3] = t_x.ravel()
+        seeds[pose] = X_pose
+    return seeds
+
+
+def _predicted_board_poses(views, pose, X):
+    """What each view of one folder says the board pose is."""
+    predicted = []
+    for view_pose, _, T_base_tcp, T_cam_board in views:
+        if view_pose == pose:
+            predicted.append(T_base_tcp @ X @ T_cam_board)
+    return predicted
 
 
 def solve(views, huber=0.003, reject=None, per_folder_x=False):
@@ -169,58 +304,35 @@ def solve(views, huber=0.003, reject=None, per_folder_x=False):
 
     Returns (X, B, per).
     """
-    if reject:
-        views = [v for v in views if (v[0], v[1]) not in reject]
+    views = _without_rejected(views, reject)
     poses = sorted({v[0] for v in views})
-    R_g = [v[2][:3, :3] for v in views]
-    t_g = [v[2][:3, 3] for v in views]
-    R_t = [v[3][:3, :3] for v in views]
-    t_t = [v[3][:3, 3] for v in views]
-    R_x, t_x = calibrate_hand_eye_park(R_g, t_g, R_t, t_t)
-    X0 = np.eye(4); X0[:3, :3] = R_x; X0[:3, 3] = t_x.ravel()
+    gripper_R, gripper_t, target_R, target_t = _pose_components(views)
 
-    # Per-folder X must be SEEDED per folder. The closed form assumes one X for
-    # everything it is given, so seeding 16 folders from one global solve puts
-    # them all in the same wrong basin -- which is what happened: the mount was
-    # changed between pose_3 and pose_4 (|t| 570 mm -> 133 mm), the global seed
-    # landed on the majority value, and poses 1-3 were then rejected as
-    # outliers despite being the correctly-solved ones.
-    X0p = {}
+    R_x, t_x = calibrate_hand_eye_park(gripper_R, gripper_t,
+                                       target_R, target_t)
+    X0 = np.eye(4)
+    X0[:3, :3] = R_x
+    X0[:3, 3] = t_x.ravel()
+
+    per_folder_seeds = {}
     if per_folder_x:
-        for p in poses:
-            idx = [i for i, v in enumerate(views) if v[0] == p]
-            Xp = np.eye(4)
-            try:
-                Rp_, tp_ = calibrate_hand_eye_park([R_g[i] for i in idx],
-                                                   [t_g[i] for i in idx],
-                                                   [R_t[i] for i in idx],
-                                                   [t_t[i] for i in idx])
-                Xp[:3, :3] = Rp_; Xp[:3, 3] = tp_.ravel()
-            except Exception:
-                Xp = X0.copy()          # too few motions in this folder
-            X0p[p] = Xp
+        per_folder_seeds = _seed_x_per_folder(views, poses, X0)
 
-    # seed each folder's board pose from the median of the per-view predictions
-    seeds = {}
-    for p in poses:
-        Xs = X0p.get(p, X0)
-        Ts = [g @ Xs @ c for pp, _, g, c in views if pp == p]
-        S = np.eye(4)
-        U, _, Vt = np.linalg.svd(sum(T[:3, :3] for T in Ts))
-        S[:3, :3] = U @ Vt
-        if np.linalg.det(S[:3, :3]) < 0:
-            U[:, -1] *= -1; S[:3, :3] = U @ Vt
-        S[:3, 3] = np.median([T[:3, 3] for T in Ts], axis=0)
-        seeds[p] = S
+    board_seeds = {}
+    for pose in poses:
+        X_seed = per_folder_seeds.get(pose, X0)
+        board_seeds[pose] = average_pose(
+            _predicted_board_poses(views, pose, X_seed))
 
-    nb = 6 * len(poses)
     nx = 6 * len(poses) if per_folder_x else 6
     pidx = {p: i for i, p in enumerate(poses)}
     vpose = [pidx[v[0]] for v in views]
     # extra parameters, laid out after the hand-eye and 6*len(poses) board ones
-    x0 = np.concatenate(([unse3(X0p[p]) for p in poses] if per_folder_x
-                         else [unse3(X0)])
-                        + [unse3(seeds[p]) for p in poses])
+    if per_folder_x:
+        x_seed = [unse3(per_folder_seeds[p]) for p in poses]
+    else:
+        x_seed = [unse3(X0)]
+    x0 = np.concatenate(x_seed + [unse3(board_seeds[p]) for p in poses])
 
     def x_of(x, i):
         k = 6 * vpose[i] if per_folder_x else 0
@@ -313,7 +425,7 @@ def evaluate(name, X, board_views, gt):
         Xp = X.get(p) if isinstance(X, dict) else X
         if Xp is None:
             continue
-        Ts = [g @ Xp @ c for pp, _, g, c in board_views if pp == p]
+        Ts = _predicted_board_poses(board_views, p, Xp)
         M = np.eye(4)
         M[:3, :3] = rot_mean([T[:3, :3] for T in Ts])
         M[:3, 3] = np.median([T[:3, 3] for T in Ts], axis=0)
@@ -400,10 +512,36 @@ def report(name, X, per):
     if np.isfinite(reach).all() and len(e) > 3:
         print(f"  residual vs reach: corr {np.corrcoef(reach, e)[0, 1]:+.2f}  "
               f"(reach {reach.min():.0f}-{reach.max():.0f} mm)")
-    bad = [r for r in per if r["corner_rms_mm"] > 5 * np.median(e)]
+    bad = _gross_outliers(per, 5 * np.median(e))
     if bad:
-        print(f"  outliers (>5x median): " +
+        print("  outliers (>5x median): " +
               ", ".join(f"pose_{r['pose']}/{r['view']} {r['corner_rms_mm']:.0f}mm" for r in bad[:4]))
+
+
+def _corner_residuals(per_view):
+    residuals = []
+    for row in per_view:
+        residuals.append(row["corner_rms_mm"])
+    return residuals
+
+
+def _outlier_keys(per_view, factor=5.0):
+    """(pose, view) of the views far above the median corner residual."""
+    threshold = factor * np.median(_corner_residuals(per_view))
+    keys = set()
+    for row in per_view:
+        if row["corner_rms_mm"] > threshold:
+            keys.add((row["pose"], row["view"]))
+    return keys
+
+
+def _gross_outliers(per_view, threshold):
+    """Rows whose corner residual exceeds `threshold`."""
+    outliers = []
+    for row in per_view:
+        if row["corner_rms_mm"] > threshold:
+            outliers.append(row)
+    return outliers
 
 
 def main():
@@ -432,8 +570,7 @@ def main():
             continue
         X, B, per = solve(views)
         report(name, X, per)
-        bad = {(r["pose"], r["view"]) for r in per
-               if r["corner_rms_mm"] > 5 * np.median([q["corner_rms_mm"] for q in per])}
+        bad = _outlier_keys(per)
         if bad:
             X, B, per = solve(views, reject=bad)
             report(name + ", outliers removed", X, per)
@@ -452,9 +589,7 @@ def main():
             # poses 1-3, the very folders whose X was correct. Re-derive the
             # outliers from this model instead.
             Xp, Bp, perp = solve(views, per_folder_x=True)
-            m = np.median([q["corner_rms_mm"] for q in perp])
-            badp = {(r["pose"], r["view"]) for r in perp
-                    if r["corner_rms_mm"] > 5 * m}
+            badp = _outlier_keys(perp)
             if badp:
                 Xp, Bp, perp = solve(views, reject=badp, per_folder_x=True)
             report(name + ", per-folder X", Xp, perp)

@@ -34,52 +34,66 @@ D_4K = np.array([0.07524467259645462, -0.10655965656042099,
                  -0.00023194379173219204, 0.00031730238697491586,
                  0.044881995767354965], np.float32)
 
+# Below this curvature the parabola through the three peak samples is flat
+# enough that its vertex is numerically meaningless.
+_MIN_PARABOLA_CURVATURE = 1e-9
 
-def scale_K(K, from_wh, to_wh):
+
+def scale_K(K, from_width_height, to_width_height):
     """Rescale intrinsics between two image sizes of the same aspect ratio."""
-    sx, sy = to_wh[0] / from_wh[0], to_wh[1] / from_wh[1]
-    out = np.array(K, np.float64)
-    out[0, :] *= sx
-    out[1, :] *= sy
-    return out
+    scale_x = to_width_height[0] / from_width_height[0]
+    scale_y = to_width_height[1] / from_width_height[1]
+    scaled = np.array(K, np.float64)
+    scaled[0, :] *= scale_x
+    scaled[1, :] *= scale_y
+    return scaled
 
 
-# ---------------------------------------------------------------- edge search
-
-def sample(img, x, y):
-    """Bilinear sample of `img` at float coordinates."""
-    return cv2.remap(img, x.astype(np.float32), y.astype(np.float32),
+def sample(image, x, y):
+    """Bilinear sample of `image` at float coordinates."""
+    return cv2.remap(image, x.astype(np.float32), y.astype(np.float32),
                      cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
 
-def edge_search(gx, gy, pm, d, S):
-    """Subpixel signed offset from each projected rim point to the strongest
-    edge along its normal.
+def _directional_gradient_profile(grad_x, grad_y, points, normals, offsets):
+    """Gradient projected onto each point's normal, sampled along that normal."""
+    sample_x = points[:, 0][:, None] + normals[:, 0][:, None] * offsets[None, :]
+    sample_y = points[:, 1][:, None] + normals[:, 1][:, None] * offsets[None, :]
+    return (sample(grad_x, sample_x, sample_y) * normals[:, 0][:, None]
+            + sample(grad_y, sample_x, sample_y) * normals[:, 1][:, None])
 
-    gx, gy  image gradients (float32)
-    pm      (N,2) projected rim points
-    d       (N,2) unit image-space normals to search along
-    S       search half-width in pixels
 
-    Returns (offset, strength, valid). The offset is signed along `d`; the
-    parabola fit through the gradient-magnitude peak is what makes it subpixel,
-    and `valid` is False where the peak sat on the edge of the search window
-    (i.e. the true edge is probably outside it).
+def _parabola_vertex_offset(left, centre, right):
+    """Vertex of the parabola through three unit-spaced samples, in samples."""
+    curvature = left - 2 * centre + right
+    vertex = np.zeros_like(curvature)
+    is_curved = np.abs(curvature) > _MIN_PARABOLA_CURVATURE
+    np.divide(0.5 * (left - right), curvature, out=vertex, where=is_curved)
+    # A vertex beyond one sample either way means the peak is not really here.
+    return np.clip(vertex, -1, 1)
+
+
+def edge_search(grad_x, grad_y, points, normals, search_halfwidth):
+    """Subpixel signed offset from each rim point to the strongest edge, in px.
+
+    Returns (offset along `normals`, peak strength, valid). `valid` is False
+    where the peak sat on the window edge, i.e. the true edge is outside it.
     """
-    offs = np.arange(-S, S + 1, dtype=np.float64)
-    sx = pm[:, 0][:, None] + d[:, 0][:, None] * offs[None, :]
-    sy = pm[:, 1][:, None] + d[:, 1][:, None] * offs[None, :]
-    dd = (sample(gx, sx, sy) * d[:, 0][:, None]
-          + sample(gy, sx, sy) * d[:, 1][:, None])
-    a = np.abs(dd)
-    k = a.argmax(1)
-    r = np.arange(len(k))
-    peak = a[r, k]
-    ok = (k > 0) & (k < len(offs) - 1) & (peak > 0)
-    ki = np.clip(k, 1, len(offs) - 2)
-    y0, y1, y2 = a[r, ki - 1], a[r, ki], a[r, ki + 1]
-    den = y0 - 2 * y1 + y2
-    safe = np.abs(den) > 1e-9
-    sub = np.zeros_like(den)
-    np.divide(0.5 * (y0 - y2), den, out=sub, where=safe)
-    return offs[ki] + np.clip(sub, -1, 1), peak, ok
+    offsets = np.arange(-search_halfwidth, search_halfwidth + 1, dtype=np.float64)
+    magnitude = np.abs(_directional_gradient_profile(
+        grad_x, grad_y, points, normals, offsets))
+
+    peak_index = magnitude.argmax(1)
+    point_index = np.arange(len(peak_index))
+    peak_strength = magnitude[point_index, peak_index]
+
+    # A peak on either end of the window means the true edge is probably
+    # outside it, so the parabola has no bracketing sample to fit through.
+    is_interior_peak = ((peak_index > 0) & (peak_index < len(offsets) - 1)
+                        & (peak_strength > 0))
+
+    clamped = np.clip(peak_index, 1, len(offsets) - 2)
+    subpixel = _parabola_vertex_offset(magnitude[point_index, clamped - 1],
+                                       magnitude[point_index, clamped],
+                                       magnitude[point_index, clamped + 1])
+    return offsets[clamped] + subpixel, peak_strength, is_interior_peak

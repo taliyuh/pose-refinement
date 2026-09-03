@@ -66,7 +66,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(HERE))
 
 import kinematics as K  # noqa: E402
-from handeye_board import CORNERS, se3, unse3, calibrate_hand_eye_park  # noqa: E402
+from handeye_board import (average_pose, board_corners,  # noqa: E402
+                           calibrate_hand_eye_park, se3, unse3)
 
 # joints whose constant offset is identifiable (0-based: shoulder_lift..wrist_2)
 FREE_OFFSET = [1, 2, 3, 4]
@@ -139,14 +140,22 @@ def flex_features(kind, TH, TB):
 
 def load(src, poses):
     """Match bundle board poses to joint captures, for the requested folders."""
-    B = json.load(open(src))
-    views = B["views"] if isinstance(B, dict) else B
-    board = {(r["pose"], r["view"]): np.asarray(r["T_cam_board"]) for r in views}
-    out = []
-    for p, v, th, T, eff, bf in K.load_joint_views(poses=poses):
-        if (p, v) in board:
-            out.append((p, v, th, T, eff, board[(p, v)]))
-    return out
+    bundled = json.load(open(src))
+    records = bundled["views"] if isinstance(bundled, dict) else bundled
+
+    board_pose_of = {}
+    for record in records:
+        board_pose_of[(record["pose"], record["view"])] = np.asarray(
+            record["T_cam_board"])
+
+    matched = []
+    for pose, view_name, theta, T_base_tcp, effort, _ in K.load_joint_views(
+            poses=poses):
+        T_cam_board = board_pose_of.get((pose, view_name))
+        if T_cam_board is None:
+            continue
+        matched.append((pose, view_name, theta, T_base_tcp, effort, T_cam_board))
+    return matched
 
 
 def solve(views, use_offset=True, huber=0.003, fixed_dtheta=None,
@@ -166,89 +175,177 @@ def solve(views, use_offset=True, huber=0.003, fixed_dtheta=None,
     demonstration that 12 free parameters can absorb 11 board poses.
     """
     poses = sorted({v[0] for v in views})
-    pidx = {p: i for i, p in enumerate(poses)}
-    TH = np.array([v[2] for v in views])
-    TC = np.array([v[5] for v in views])
-    vp = np.array([pidx[v[0]] for v in views])
+    pose_index = {pose: i for i, pose in enumerate(poses)}
+    theta = np.array([v[2] for v in views])
+    T_cam_board = np.array([v[5] for v in views])
+    view_pose = np.array([pose_index[v[0]] for v in views])
 
-    # seed from the MODEL FK so the seed lives in the same frame as the fit
-    TB = np.array([K.fk(t) for t in TH])
-    R_x, t_x = calibrate_hand_eye_park([T[:3, :3] for T in TB],
-                                       [T[:3, 3] for T in TB],
-                                       [T[:3, :3] for T in TC],
-                                       [T[:3, 3] for T in TC])
-    X0 = np.eye(4); X0[:3, :3] = R_x; X0[:3, 3] = t_x.ravel()
+    # Seed from the MODEL FK so the seed lives in the same frame as the fit.
+    T_fk = np.array([K.fk(t) for t in theta])
+    X0 = _seed_hand_eye(T_fk, T_cam_board)
 
     seeds = []
-    for p in poses:
-        Ts = [TB[i] @ X0 @ TC[i] for i in range(len(views)) if vp[i] == pidx[p]]
-        S = np.eye(4)
-        U, _, Vt = np.linalg.svd(sum(T[:3, :3] for T in Ts))
-        S[:3, :3] = U @ Vt
-        if np.linalg.det(S[:3, :3]) < 0:
-            U[:, -1] *= -1; S[:3, :3] = U @ Vt
-        S[:3, 3] = np.median([T[:3, 3] for T in Ts], axis=0)
-        seeds.append(unse3(S))
+    for pose in poses:
+        predicted = _predicted_board_poses(T_fk, T_cam_board, X0, view_pose,
+                                           pose_index[pose])
+        seeds.append(unse3(average_pose(predicted)))
 
-    n_off = len(FREE_OFFSET) if use_offset else 0
-    o_off = 6 + 6 * len(poses)
-    o_flex = o_off + n_off
-    F = flex_features(flex, TH, TB) if flex else None
-    n_flex = 6 * F.shape[1] if (flex and fixed_flex is None) else 0
-    x0 = np.concatenate([unse3(X0)] + seeds + [np.zeros(n_off + n_flex)])
+    offset_count = len(FREE_OFFSET) if use_offset else 0
+    offset_at = 6 + 6 * len(poses)
+    flex_at = offset_at + offset_count
 
-    def theta_eff(x):
-        th = TH.copy()
+    features = flex_features(flex, theta, T_fk) if flex else None
+    if flex and fixed_flex is None:
+        flex_count = 6 * features.shape[1]
+    else:
+        flex_count = 0
+    x0 = np.concatenate([unse3(X0)] + seeds
+                        + [np.zeros(offset_count + flex_count)])
+
+    def effective_theta(x):
+        adjusted = theta.copy()
         if fixed_dtheta is not None:
-            th = th + fixed_dtheta          # applied, not fitted
+            adjusted = adjusted + fixed_dtheta      # applied, not fitted
         if use_offset:
-            d = np.zeros(6)
-            d[FREE_OFFSET] = x[o_off:o_off + n_off]
-            th = th + d
-        return th
+            joint_offset = np.zeros(6)
+            joint_offset[FREE_OFFSET] = x[offset_at:offset_at + offset_count]
+            adjusted = adjusted + joint_offset
+        return adjusted
 
-    def flex_M(x):
+    def flex_matrix(x):
         if not flex:
             return None
         if fixed_flex is not None:
             return np.asarray(fixed_flex)
-        return x[o_flex:o_flex + n_flex].reshape(6, F.shape[1])
+        return x[flex_at:flex_at + flex_count].reshape(6, features.shape[1])
 
     def resid(x):
         X = se3(x[0:3], x[3:6])
-        Bs = [se3(x[6 + 6 * i:9 + 6 * i], x[9 + 6 * i:12 + 6 * i])
-              for i in range(len(poses))]
-        th = theta_eff(x)
-        M = flex_M(x)
-        out = np.empty((len(views), 12))
-        for i in range(len(views)):
-            Xi = X if M is None else se3(*np.split(M @ F[i], 2)) @ X
-            A = K.fk(th[i]) @ Xi @ TC[i]
-            B = Bs[vp[i]]
-            out[i] = ((CORNERS @ A[:3, :3].T + A[:3, 3])
-                      - (CORNERS @ B[:3, :3].T + B[:3, 3])).ravel()
-        if flex and flex_prior and fixed_flex is None:
-            lev = 0.47                      # m, camera to board
-            pen = np.concatenate([M[:3].ravel() * lev, M[3:].ravel()])
-            return np.concatenate([out.ravel(), pen / flex_prior * huber])
-        return out.ravel()
+        board_poses = _unpack_board_poses(x, len(poses))
+        adjusted_theta = effective_theta(x)
+        flex_M = flex_matrix(x)
 
-    sol = least_squares(resid, x0, loss="soft_l1", f_scale=huber, max_nfev=300)
-    nv12 = 12 * len(views)              # prior rows, if any, come after
-    r = resid(sol.x)[:nv12].reshape(len(views), 4, 3)
-    per = np.sqrt((r ** 2).sum(2).mean(1)) * 1000
-    info = {"X": se3(sol.x[0:3], sol.x[3:6]),
-            "per_view_mm": per,
+        corner_errors = np.empty((len(views), 12))
+        for i in range(len(views)):
+            X_view = X
+            if flex_M is not None:
+                X_view = se3(*np.split(flex_M @ features[i], 2)) @ X
+            predicted = K.fk(adjusted_theta[i]) @ X_view @ T_cam_board[i]
+            corner_errors[i] = (board_corners(predicted)
+                                - board_corners(board_poses[view_pose[i]])).ravel()
+
+        if flex and flex_prior and fixed_flex is None:
+            penalty = _flex_penalty(flex_M, flex_prior, huber)
+            return np.concatenate([corner_errors.ravel(), penalty])
+        return corner_errors.ravel()
+
+    solution = least_squares(resid, x0, loss="soft_l1", f_scale=huber,
+                             max_nfev=300)
+
+    corner_rows = 12 * len(views)       # prior rows, if any, come after
+    per_view = resid(solution.x)[:corner_rows].reshape(len(views), 4, 3)
+    per_view_mm = np.sqrt((per_view ** 2).sum(2).mean(1)) * 1000
+
+    info = {"X": se3(solution.x[0:3], solution.x[3:6]),
+            "per_view_mm": per_view_mm,
             "poses": poses,
-            "vp": vp,
+            "vp": view_pose,
             "dtheta": np.zeros(6),
             "flex": None}
     if use_offset:
-        info["dtheta"][FREE_OFFSET] = sol.x[o_off:o_off + n_off]
+        info["dtheta"][FREE_OFFSET] = solution.x[offset_at:offset_at + offset_count]
     if flex:
-        info["flex"] = (np.asarray(fixed_flex) if fixed_flex is not None
-                        else sol.x[o_flex:o_flex + n_flex].reshape(6, F.shape[1]))
+        info["flex"] = _fitted_flex(solution.x, fixed_flex, flex_at,
+                                    flex_count, features)
     return info
+
+
+def _seed_hand_eye(T_fk, T_cam_board):
+    """Closed-form X from the FK and camera-frame board poses."""
+    R_x, t_x = calibrate_hand_eye_park([T[:3, :3] for T in T_fk],
+                                       [T[:3, 3] for T in T_fk],
+                                       [T[:3, :3] for T in T_cam_board],
+                                       [T[:3, 3] for T in T_cam_board])
+    X0 = np.eye(4)
+    X0[:3, :3] = R_x
+    X0[:3, 3] = t_x.ravel()
+    return X0
+
+
+def _predicted_board_poses(T_fk, T_cam_board, X, view_pose, wanted):
+    """What each view of one folder says the board pose is."""
+    predicted = []
+    for i in range(len(T_fk)):
+        if view_pose[i] == wanted:
+            predicted.append(T_fk[i] @ X @ T_cam_board[i])
+    return predicted
+
+
+def _unpack_board_poses(x, pose_count):
+    board_poses = []
+    for i in range(pose_count):
+        board_poses.append(se3(x[6 + 6 * i:9 + 6 * i], x[9 + 6 * i:12 + 6 * i]))
+    return board_poses
+
+
+def _flex_penalty(flex_M, flex_prior, huber):
+    """Deflection amplitude as a displacement at the board, in prior units."""
+    camera_to_board_m = 0.47
+    amplitude = np.concatenate([flex_M[:3].ravel() * camera_to_board_m,
+                                flex_M[3:].ravel()])
+    return amplitude / flex_prior * huber
+
+
+def _fitted_flex(x, fixed_flex, flex_at, flex_count, features):
+    if fixed_flex is not None:
+        return np.asarray(fixed_flex)
+    return x[flex_at:flex_at + flex_count].reshape(6, features.shape[1])
+
+
+def _exclude_foreign_frame(views, foreign_pose=16):
+    """pose_16 is in the 'world' frame and is not comparable with the rest."""
+    kept = []
+    for view in views:
+        if view[0] != foreign_pose:
+            kept.append(view)
+    return kept
+
+
+def _keep_where(views, keep_flags):
+    kept = []
+    for view, keep in zip(views, keep_flags):
+        if keep:
+            kept.append(view)
+    return kept
+
+
+def _split_out_folder(views, pose):
+    """(held-out folder, everything else) for leave-one-folder-out."""
+    held_out, rest = [], []
+    for view in views:
+        if view[0] == pose:
+            held_out.append(view)
+        else:
+            rest.append(view)
+    return held_out, rest
+
+
+def _count_improved(baseline, corrected):
+    """Folds where the fitted model beat the baseline."""
+    improved = 0
+    for before, after in zip(baseline, corrected):
+        if after < before:
+            improved += 1
+    return improved
+
+
+def _format_offsets(dtheta):
+    """Non-zero joint offsets as "j2 +0.1234  j3 -0.5678"."""
+    parts = []
+    for joint, offset in enumerate(dtheta):
+        if offset:
+            parts.append(f"j{joint + 1} {np.degrees(offset):+.4f}")
+    return "  ".join(parts)
 
 
 def main():
@@ -262,7 +359,7 @@ def main():
     poses = [int(s) for s in args.poses.split(",")]
 
     print("checking the identified UR5 model against the logged FK ...")
-    kv = [v for v in K.load_joint_views(poses=poses) if v[0] != 16]
+    kv = _exclude_foreign_frame(K.load_joint_views(poses=poses))
     _, sc = K.fit_base_transform(kv)
     print(f"  UR5 reproduces the logged FK to median {np.median(sc):.3f} mm, "
           f"max {sc.max():.3f} mm over {len(kv)} views")
@@ -291,7 +388,7 @@ def main():
               + ", ".join(f"pose_{views[i][0]}/{views[i][1]}"
                           for i in np.nonzero(~keep)[0][:6])
               + (" ..." if (~keep).sum() > 6 else ""))
-        views = [v for v, k in zip(views, keep) if k]
+        views = _keep_where(views, keep)
 
     best, out = None, {}
     for name, uo in runs:
@@ -301,9 +398,7 @@ def main():
         print(f"  board-corner residual: median {np.median(e):5.3f}  "
               f"p90 {np.percentile(e, 90):5.3f}  max {e.max():6.3f} mm")
         if uo:
-            print("  joint offsets (deg): "
-                  + "  ".join(f"j{i+1} {np.degrees(d):+.4f}"
-                              for i, d in enumerate(info["dtheta"]) if d))
+            print("  joint offsets (deg): " + _format_offsets(info["dtheta"]))
         t = info["X"][:3, 3] * 1000
         print(f"  X t [{t[0]:+8.2f} {t[1]:+8.2f} {t[2]:+8.2f}] mm  "
               f"|t| {np.linalg.norm(t):7.2f}")
@@ -322,8 +417,7 @@ def main():
     fold_poses = sorted({v[0] for v in views})
     cv_base, cv_corr = [], []
     for p in fold_poses:
-        tr = [v for v in views if v[0] != p]
-        te = [v for v in views if v[0] == p]
+        te, tr = _split_out_folder(views, p)
         trained = solve(tr, use_offset=True)
         held_b = solve(te, use_offset=False)
         held_c = solve(te, use_offset=False, fixed_dtheta=trained["dtheta"])
@@ -333,12 +427,12 @@ def main():
               f"transferred offsets {c:6.3f} mm   {'better' if c < b else 'WORSE'}")
     print(f"  overall: baseline {np.median(cv_base):.3f} -> "
           f"{np.median(cv_corr):.3f} mm median across folds "
-          f"({sum(1 for b, c in zip(cv_base, cv_corr) if c < b)}/"
+          f"({_count_improved(cv_base, cv_corr)}/"
           f"{len(cv_base)} folds improved)")
     out["cross_validation"] = {
         "baseline_median_mm": float(np.median(cv_base)),
         "transferred_median_mm": float(np.median(cv_corr)),
-        "folds_improved": int(sum(1 for b, c in zip(cv_base, cv_corr) if c < b)),
+        "folds_improved": _count_improved(cv_base, cv_corr),
         "folds": len(cv_base)}
 
     print(f"\nbest: {best[0]} at {best[1]:.3f} mm median")

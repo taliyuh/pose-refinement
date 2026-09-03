@@ -26,6 +26,7 @@ characteristic signature, so they can be rejected rather than averaged in.
 import argparse
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -36,8 +37,9 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(HERE))
 
 import kinematics as K  # noqa: E402
-from handeye_board import (CORNERS, se3, unse3,  # noqa: E402
-                           calibrate_hand_eye_park)
+from handeye_board import (average_pose, board_corners,  # noqa: E402
+                           calibrate_hand_eye_park, corner_spread_mm,
+                           se3, unse3)
 from scipy.optimize import least_squares  # noqa: E402
 
 MOUNT_A = [1, 2, 3]          # camera mount before the pose_3/pose_4 remount
@@ -64,117 +66,205 @@ def fit_x_and_boards(Tb, Tc, grp, huber=0.003, w=None):
     X0 = np.eye(4); X0[:3, :3] = R_x; X0[:3, 3] = t_x.ravel()
 
     seeds = []
-    for p in folders:
-        Ts = [Tb[i] @ X0 @ Tc[i] for i in range(len(Tb)) if gi[i] == fidx[p]]
-        seeds.append(unse3(consensus(Ts)))
+    for folder in folders:
+        predicted = []
+        for i in range(len(Tb)):
+            if gi[i] == fidx[folder]:
+                predicted.append(Tb[i] @ X0 @ Tc[i])
+        seeds.append(unse3(consensus(predicted)))
     x0 = np.concatenate([unse3(X0)] + seeds)
-
-    A = np.array([Tb[i] @ np.eye(4) for i in range(len(Tb))])
+    tcp_poses = np.array(Tb)
 
     def resid(x):
         X = se3(x[0:3], x[3:6])
-        Bs = [se3(x[6 + 6 * i:9 + 6 * i], x[9 + 6 * i:12 + 6 * i])
-              for i in range(len(folders))]
-        out = np.empty((len(Tb), 12))
+        board_poses = _unpack_board_poses(x, len(folders))
+        corner_errors = np.empty((len(Tb), 12))
         for i in range(len(Tb)):
-            P = A[i] @ X @ Tc[i]
-            B = Bs[gi[i]]
-            out[i] = w[i] * ((CORNERS @ P[:3, :3].T + P[:3, 3])
-                             - (CORNERS @ B[:3, :3].T + B[:3, 3])).ravel()
-        return out.ravel()
+            predicted = tcp_poses[i] @ X @ Tc[i]
+            delta = (board_corners(predicted)
+                     - board_corners(board_poses[gi[i]]))
+            corner_errors[i] = w[i] * delta.ravel()
+        return corner_errors.ravel()
 
-    sol = least_squares(resid, x0, loss="soft_l1", f_scale=huber, max_nfev=300)
-    X = se3(sol.x[0:3], sol.x[3:6])
-    boards = {p: se3(sol.x[6 + 6 * i:9 + 6 * i], sol.x[9 + 6 * i:12 + 6 * i])
-              for p, i in fidx.items()}
+    solution = least_squares(resid, x0, loss="soft_l1", f_scale=huber,
+                             max_nfev=300)
+    X = se3(solution.x[0:3], solution.x[3:6])
+    board_poses = _unpack_board_poses(solution.x, len(folders))
+
+    boards = {}
+    for folder, i in fidx.items():
+        boards[folder] = board_poses[i]
     return X, boards
 
 
-def consensus(Ts):
-    """Robust average pose of a set: chordal-mean rotation, median translation."""
-    U, _, Vt = np.linalg.svd(sum(T[:3, :3] for T in Ts))
-    R = U @ Vt
-    if np.linalg.det(R) < 0:
-        U[:, -1] *= -1
-        R = U @ Vt
-    C = np.eye(4)
-    C[:3, :3], C[:3, 3] = R, np.median([T[:3, 3] for T in Ts], axis=0)
-    return C
+def _unpack_board_poses(x, folder_count):
+    """The per-folder board poses packed after the hand-eye."""
+    board_poses = []
+    for i in range(folder_count):
+        board_poses.append(se3(x[6 + 6 * i:9 + 6 * i], x[9 + 6 * i:12 + 6 * i]))
+    return board_poses
 
 
-def corner_dev(T, C):
-    """Deviation of pose T from consensus C, as an RMS over the board corners.
+# consensus() is the shared rotation-average; kept as a local name because
+# "consensus of a folder" is what it means here.
+consensus = average_pose
+
+
+def corner_dev(pose, consensus_pose):
+    """RMS deviation of `pose` from the consensus, over the board corners, mm.
 
     Corners rather than the origin: an origin-only distance is blind to a pure
     rotation about the origin, which is exactly what a yaw flip is.
     """
-    a = CORNERS @ T[:3, :3].T + T[:3, 3]
-    b = CORNERS @ C[:3, :3].T + C[:3, 3]
-    return float(np.sqrt(((a - b) ** 2).sum(1).mean()) * 1000)
+    delta = board_corners(pose) - board_corners(consensus_pose)
+    rms_mm, _ = corner_spread_mm(delta)
+    return rms_mm
 
 
-def yaw_about_normal(T, C):
-    """Rotation of T relative to C, decomposed into (about board z, tilt) deg."""
-    D = C[:3, :3].T @ T[:3, :3]
-    ang = np.degrees(np.arccos(np.clip((np.trace(D) - 1) / 2, -1, 1)))
-    # axis component along board z tells a yaw flip from a tilt error
-    w = np.array([D[2, 1] - D[1, 2], D[0, 2] - D[2, 0], D[1, 0] - D[0, 1]])
-    n = np.linalg.norm(w)
-    axis_z = abs(w[2] / n) if n > 1e-9 else 1.0
-    return ang, axis_z
+def yaw_about_normal(pose, consensus_pose):
+    """Rotation of `pose` relative to consensus, as (angle deg, |axis.z|)."""
+    relative = consensus_pose[:3, :3].T @ pose[:3, :3]
+    angle_deg = np.degrees(np.arccos(
+        np.clip((np.trace(relative) - 1) / 2, -1, 1)))
+
+    # The axis component along board z separates a yaw flip from a tilt error.
+    axis = np.array([relative[2, 1] - relative[1, 2],
+                     relative[0, 2] - relative[2, 0],
+                     relative[1, 0] - relative[0, 1]])
+    axis_length = np.linalg.norm(axis)
+    if axis_length <= 1e-9:
+        return angle_deg, 1.0
+    return angle_deg, abs(axis[2] / axis_length)
+
+
+@dataclass
+class _Capture:
+    """One view with everything the hand-eye fit needs from it."""
+    pose: int
+    view: str
+    theta: object            # None for legacy cached captures
+    T_base_tcp: np.ndarray
+    T_cam_board: np.ndarray
+    mad_px: object
 
 
 def board_poses(src, cache_p=None, use_offsets=None, gate=1.2):
     """T_base_board per view, grouped by folder, with a per-mount hand-eye X."""
-    B = json.load(open(src))
-    views = B["views"] if isinstance(B, dict) else B
-    board = {(r["pose"], r["view"]): np.asarray(r["T_cam_board"]) for r in views}
-    mad = {(r["pose"], r["view"]): r.get("mad_px") for r in views}
+    bundled = json.load(open(src))
+    records = bundled["views"] if isinstance(bundled, dict) else bundled
+    board_of, mad_of = _index_bundle(records)
 
-    # T_base_tcp comes from the joint angles, so joint offsets can be applied.
-    rows = []
-    for p, v, th, T, eff, bf in K.load_joint_views():
-        if (p, v) in board:
-            rows.append([p, v, th, T, board[(p, v)], mad[(p, v)]])
+    captures = _captures_with_joints(board_of, mad_of)
+    captures += _captures_from_cache(cache_p, board_of, mad_of, captures)
+    if use_offsets is not None:
+        _apply_joint_offsets(captures, use_offsets)
 
-    # Legacy fallback: captures made before capture_board_view.py logged
-    # joints.json have only the FK output, cached externally. Optional, and
-    # unnecessary for anything captured with this repo -- such views cannot
-    # carry joint offsets either, which is why the cache was retired.
-    if cache_p and Path(cache_p).exists():
-        have = {(r[0], r[1]) for r in rows}
-        cache = json.load(open(cache_p))
-        for p in cache:
-            for v, rec in cache[p].items():
-                if (int(p), v) in have or (int(p), v) not in board:
-                    continue
-                if rec.get("T_base_tcp") is None:
-                    continue
-                rows.append([int(p), v, None, np.asarray(rec["T_base_tcp"]),
-                             board[(int(p), v)], mad[(int(p), v)]])
-
-    # FK: recomputed with joint offsets when asked and available, else logged.
-    for r in rows:
-        if use_offsets is not None and r[2] is not None:
-            r[3] = K.fk(np.asarray(r[2]) + use_offsets)
-        r.append(None)
-
-    out, fitted = {}, {}
+    poses_by_folder, fitted_boards = {}, {}
     for mount in ("A", "B"):
-        sel = [r for r in rows if (r[0] in MOUNT_A) == (mount == "A")]
-        if not sel:
+        on_mount = _captures_on_mount(captures, mount)
+        if not on_mount:
             continue
-        Tb, Tc = [r[3] for r in sel], [r[4] for r in sel]
-        grp = [r[0] for r in sel]
-        # Downweight the views the per-view fit already distrusts, so a flipped
-        # pose cannot pull the shared X it is being measured against.
-        w = np.array([1.0 if (r[5] or 0) <= gate else 0.05 for r in sel])
-        X, boards = fit_x_and_boards(Tb, Tc, grp, w=w)
-        fitted.update(boards)
-        for r in sel:
-            out.setdefault(r[0], []).append(
-                (r[1], r[3] @ X @ r[4], r[5], r[4]))
-    return out, fitted
+        X = _fit_mount(on_mount, gate, fitted_boards)
+        for capture in on_mount:
+            poses_by_folder.setdefault(capture.pose, []).append(
+                (capture.view, capture.T_base_tcp @ X @ capture.T_cam_board,
+                 capture.mad_px, capture.T_cam_board))
+    return poses_by_folder, fitted_boards
+
+
+def _index_bundle(records):
+    """(T_cam_board, mad_px) keyed by (pose, view)."""
+    board_of, mad_of = {}, {}
+    for record in records:
+        key = (record["pose"], record["view"])
+        board_of[key] = np.asarray(record["T_cam_board"])
+        mad_of[key] = record.get("mad_px")
+    return board_of, mad_of
+
+
+def _captures_with_joints(board_of, mad_of):
+    """T_base_tcp comes from the joint angles, so offsets can be applied."""
+    captures = []
+    for pose, view, theta, T_base_tcp, _, _ in K.load_joint_views():
+        key = (pose, view)
+        if key not in board_of:
+            continue
+        captures.append(_Capture(pose, view, theta, T_base_tcp,
+                                 board_of[key], mad_of[key]))
+    return captures
+
+
+def _captures_from_cache(cache_p, board_of, mad_of, already_loaded):
+    """Legacy fallback for captures made before joints.json was logged.
+
+    Optional, and unnecessary for anything captured with this repo -- such
+    views cannot carry joint offsets either, which is why the cache was
+    retired.
+    """
+    if not cache_p or not Path(cache_p).exists():
+        return []
+
+    seen = set()
+    for capture in already_loaded:
+        seen.add((capture.pose, capture.view))
+
+    cache = json.load(open(cache_p))
+    captures = []
+    for pose in cache:
+        for view, cached in cache[pose].items():
+            key = (int(pose), view)
+            if key in seen or key not in board_of:
+                continue
+            if cached.get("T_base_tcp") is None:
+                continue
+            captures.append(_Capture(key[0], view, None,
+                                     np.asarray(cached["T_base_tcp"]),
+                                     board_of[key], mad_of[key]))
+    return captures
+
+
+def _apply_joint_offsets(captures, offsets):
+    """Recompute FK with joint offsets where joint angles are available."""
+    for capture in captures:
+        if capture.theta is None:
+            continue
+        capture.T_base_tcp = K.fk(np.asarray(capture.theta) + offsets)
+
+
+def _captures_on_mount(captures, mount):
+    """The camera mount changed at pose_4; the two are not comparable."""
+    on_mount = []
+    for capture in captures:
+        if (capture.pose in MOUNT_A) == (mount == "A"):
+            on_mount.append(capture)
+    return on_mount
+
+
+def _fit_mount(captures, gate, fitted_boards):
+    """Shared X for one mount; folder board poses land in `fitted_boards`."""
+    T_base_tcp = [c.T_base_tcp for c in captures]
+    T_cam_board = [c.T_cam_board for c in captures]
+    folders = [c.pose for c in captures]
+
+    # Downweight the views the per-view fit already distrusts, so a flipped
+    # pose cannot pull the shared X it is being measured against.
+    weights = []
+    for capture in captures:
+        trusted = (capture.mad_px or 0) <= gate
+        weights.append(1.0 if trusted else 0.05)
+
+    X, boards = fit_x_and_boards(T_base_tcp, T_cam_board, folders,
+                                 w=np.array(weights))
+    fitted_boards.update(boards)
+    return X
+
+
+def _keep_where(poses, keep_flags):
+    kept = []
+    for pose, keep in zip(poses, keep_flags):
+        if keep:
+            kept.append(pose)
+    return kept
 
 
 def analyse(groups, k=3.0, floor=1.0, verbose=True):
@@ -199,7 +289,7 @@ def analyse(groups, k=3.0, floor=1.0, verbose=True):
 
         # recompute consensus on the survivors, then re-measure
         if keep.sum() >= 3:
-            C2 = consensus([T for T, kk in zip(Ts, keep) if kk])
+            C2 = consensus(_keep_where(Ts, keep))
             dev2 = np.array([corner_dev(T, C2) for T in Ts])
         else:
             C2, dev2, keep = C, dev, np.ones(len(dev), bool)

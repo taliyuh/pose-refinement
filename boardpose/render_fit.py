@@ -29,7 +29,7 @@ sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(HERE))
 
 
 import board_model  # noqa: E402
-from bundle_rims import project, project_with_normals  # noqa: E402
+from bundle_rims import project  # noqa: E402
 from camera import K_4K, D_4K  # noqa: E402
 
 ZOOM = 3

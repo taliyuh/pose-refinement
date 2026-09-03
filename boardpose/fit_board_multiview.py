@@ -113,8 +113,10 @@ sys.path.insert(0, str(HERE))
 
 import board_model  # noqa: E402
 import kinematics as K  # noqa: E402
-from bundle_rims import MARGIN, measure, project, project_with_normals  # noqa: E402
-from handeye_board import CORNERS, se3, unse3  # noqa: E402
+from bundle_rims import (crop_bounds, gradient_images, measure,  # noqa: E402
+                         project, project_with_normals)
+from handeye_board import (average_pose, board_corners,  # noqa: E402
+                           corner_spread_mm, se3, unse3)
 
 
 # ------------------------------------------------------------------- loading
@@ -127,58 +129,96 @@ class MView:
 
 def load(pose, bundle, dtheta, data, max_radius, quiet=False):
     """Views of one folder that have BOTH a bundled board pose and joints."""
-    B = json.load(open(bundle))
-    intr = np.array(B["intrinsics"], float)
-    bias = board_model.pad_bias(B.get("rim_bias", board_model.RIM_BIAS0))
-    seed = {(r["pose"], r["view"]): r for r in B["views"] if r["pose"] == pose}
-    joints = {(p, v): th for p, v, th, _, _, _ in K.load_joint_views(poses=[pose])}
-
+    bundled = json.load(open(bundle))
+    intrinsics = np.array(bundled["intrinsics"], float)
+    bias = board_model.pad_bias(bundled.get("rim_bias", board_model.RIM_BIAS0))
+    bundled_views = _bundled_views_of_pose(bundled, pose)
+    theta_of = _theta_by_view(pose)
     pts3 = board_model.build_levels()[0]
-    out, dropped = [], []
-    for (p, v), r in sorted(seed.items()):
-        if (p, v) not in joints:
-            continue
-        img = cv2.imread(str(data / f"pose_{p}" / v / "color.png"),
-                         cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            continue
-        T = np.asarray(r["T_cam_board"])
-        rvec = cv2.Rodrigues(T[:3, :3])[0].ravel()
-        tvec = T[:3, 3].copy()
 
-        c = project(pts3, rvec, tvec, intr)
-        # Gate on where the board sits in the frame. Tilt error explodes off
-        # axis -- 2 of 147 views sit beyond 600 px from the principal point and
-        # carry 1.45 deg of it, 8x the median, and mad_px does not catch them.
-        rad = float(np.hypot(c[:, 0].mean() - intr[2], c[:, 1].mean() - intr[3]))
-        if rad > max_radius:
-            dropped.append((v, f"board {rad:.0f} px off axis"))
+    views, rejections = [], []
+    for (pose_id, view_name), bundled_view in sorted(bundled_views.items()):
+        theta = theta_of.get((pose_id, view_name))
+        if theta is None:
             continue
-        x0 = int(max(0, c[:, 0].min() - MARGIN))
-        x1 = int(min(img.shape[1], c[:, 0].max() + MARGIN))
-        y0 = int(max(0, c[:, 1].min() - MARGIN))
-        y1 = int(min(img.shape[0], c[:, 1].max() + MARGIN))
-        if x1 - x0 < 200 or y1 - y0 < 200:
-            dropped.append((v, "board outside the frame"))
+        image = _read_gray(data / f"pose_{pose_id}" / view_name / "color.png")
+        if image is None:
             continue
 
-        g = cv2.GaussianBlur(img[y0:y1, x0:x1], (0, 0), 1.6)
-        m = MView()
-        m.pose, m.name = p, v
-        m.gx = cv2.Scharr(g, cv2.CV_32F, 1, 0)
-        m.gy = cv2.Scharr(g, cv2.CV_32F, 0, 1)
-        m.ox, m.oy = x0, y0
-        m.rvec, m.tvec = rvec, tvec
-        m.theta = joints[(p, v)]
-        m.T_fk = K.fk(m.theta + dtheta)
-        m.seed = T
-        m.radius_px, m.n_seed = rad, int(r["n"])
-        out.append(m)
+        view, rejected_because = _build_view(pose_id, view_name, bundled_view,
+                                             image, pts3, intrinsics, theta,
+                                             dtheta, max_radius)
+        if view is None:
+            rejections.append((view_name, rejected_because))
+            continue
+        views.append(view)
 
-    if dropped and not quiet:
-        for v, why in dropped:
-            print(f"    dropped {v}: {why}")
-    return out, intr, bias
+    if not quiet:
+        _print_rejections(rejections)
+    return views, intrinsics, bias
+
+
+def _bundled_views_of_pose(bundled, pose):
+    """Bundled per-view records for one folder, keyed by (pose, view)."""
+    selected = {}
+    for record in bundled["views"]:
+        if record["pose"] == pose:
+            selected[(record["pose"], record["view"])] = record
+    return selected
+
+
+def _theta_by_view(pose):
+    """Joint angles for one folder, keyed by (pose, view)."""
+    theta_of = {}
+    for pose_id, view_name, theta, _, _, _ in K.load_joint_views(poses=[pose]):
+        theta_of[(pose_id, view_name)] = theta
+    return theta_of
+
+
+def _read_gray(path):
+    return cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+
+
+def _print_rejections(rejections):
+    for view_name, why in rejections:
+        print(f"    dropped {view_name}: {why}")
+
+
+def _board_offset_px(projected, intrinsics):
+    """How far the board centre sits from the principal point."""
+    return float(np.hypot(projected[:, 0].mean() - intrinsics[2],
+                          projected[:, 1].mean() - intrinsics[3]))
+
+
+def _build_view(pose_id, view_name, bundled_view, image, pts3, intrinsics,
+                theta, dtheta, max_radius):
+    """Returns (view, None), or (None, reason) when the view is unusable."""
+    T_cam_board = np.asarray(bundled_view["T_cam_board"])
+    rvec = cv2.Rodrigues(T_cam_board[:3, :3])[0].ravel()
+    tvec = T_cam_board[:3, 3].copy()
+    projected = project(pts3, rvec, tvec, intrinsics)
+
+    # Tilt error explodes off axis: 2 of 147 views sit beyond 600 px from the
+    # principal point and carry 1.45 deg of it, 8x the median, which mad_px
+    # does not catch.
+    offset_px = _board_offset_px(projected, intrinsics)
+    if offset_px > max_radius:
+        return None, f"board {offset_px:.0f} px off axis"
+
+    x0, x1, y0, y1 = crop_bounds(projected, image.shape)
+    if x1 - x0 < 200 or y1 - y0 < 200:
+        return None, "board outside the frame"
+
+    view = MView()
+    view.pose, view.name = pose_id, view_name
+    view.gx, view.gy = gradient_images(image, x0, x1, y0, y1)
+    view.ox, view.oy = x0, y0
+    view.rvec, view.tvec = rvec, tvec
+    view.theta = theta
+    view.T_fk = K.fk(theta + dtheta)
+    view.seed = T_cam_board
+    view.radius_px, view.n_seed = offset_px, int(bundled_view["n"])
+    return view, None
 
 
 # -------------------------------------------------------------------- the fit
@@ -186,41 +226,49 @@ def load(pose, bundle, dtheta, data, max_radius, quiet=False):
 DEFAULT_CHAIN_SIGMA = 0.40     # mm at the board; see the module docstring
 
 
+def _chain_poses(views, X0):
+    """Each view's own board pose pushed through the chain, in the FK frame."""
+    return [view.T_fk @ X0 @ view.seed for view in views]
+
+
 def seed_pose(views, X0):
     """Median of what the per-view poses already say, in the FK frame."""
-    Ts = [v.T_fk @ X0 @ v.seed for v in views]
-    S = np.eye(4)
-    U, _, Vt = np.linalg.svd(sum(T[:3, :3] for T in Ts))
-    S[:3, :3] = U @ Vt
-    if np.linalg.det(S[:3, :3]) < 0:
-        U[:, -1] *= -1; S[:3, :3] = U @ Vt
-    S[:3, 3] = np.median([T[:3, 3] for T in Ts], axis=0)
-    return S
+    return average_pose(_chain_poses(views, X0))
 
 
 def unpack(x, views, refine_x, X0):
     """(T_base_board, X, [per-view chain perturbation])."""
-    Tb = se3(x[0:3], x[3:6])
-    o = 6
+    T_base_board = se3(x[0:3], x[3:6])
+    offset = 6
+
     X = X0
     if refine_x:
-        X = se3(x[o:o + 3], x[o + 3:o + 6]); o += 6
-    xi = [x[o + 6 * i:o + 6 * i + 6] for i in range(len(views))]
-    return Tb, X, xi
+        X = se3(x[offset:offset + 3], x[offset + 3:offset + 6])
+        offset += 6
+
+    chain_slack = [x[offset + 6 * i:offset + 6 * i + 6]
+                   for i in range(len(views))]
+    return T_base_board, X, chain_slack
 
 
 def poses_from(x, views, refine_x, X0):
     """Per-view T_cam_board implied by the current parameters."""
-    Tb, X, xi = unpack(x, views, refine_x, X0)
-    Xi = np.linalg.inv(X)
-    return [Xi @ np.linalg.inv(v.T_fk @ se3(z[:3], z[3:6])) @ Tb
-            for v, z in zip(views, xi)]
+    T_base_board, X, chain_slack = unpack(x, views, refine_x, X0)
+    X_inv = np.linalg.inv(X)
+    return [_cam_board_pose(view, slack, X_inv, T_base_board)
+            for view, slack in zip(views, chain_slack)]
+
+
+def _cam_board_pose(view, slack, X_inv, T_base_board):
+    """T_cam_board for one view under the current chain perturbation."""
+    perturbed_chain = view.T_fk @ se3(slack[:3], slack[3:6])
+    return X_inv @ np.linalg.inv(perturbed_chain) @ T_base_board
 
 
 def apply_poses(x, views, refine_x, X0):
-    for v, T in zip(views, poses_from(x, views, refine_x, X0)):
-        v.rvec = cv2.Rodrigues(T[:3, :3])[0].ravel()
-        v.tvec = T[:3, 3]
+    for view, T_cam_board in zip(views, poses_from(x, views, refine_x, X0)):
+        view.rvec = cv2.Rodrigues(T_cam_board[:3, :3])[0].ravel()
+        view.tvec = T_cam_board[:3, 3]
 
 
 def solve(views, intr, X0, pts3, nrm2, level, loop, bias=None, refine_x=False,
@@ -228,101 +276,132 @@ def solve(views, intr, X0, pts3, nrm2, level, loop, bias=None, refine_x=False,
           seed_board=None, verbose=True):
     """Fit one shared T_base_board, with per-view chain slack under a prior.
 
-    chain_sigma  [mm]  how far the chain is trusted, as a displacement at the
-                       board. This is the single knob that decides how much a
-                       view's disagreement is blamed on the arm rather than on
-                       the board pose.
-    rim_sigma_px [px]  the rim edge noise, used only to put the image residuals
-                       and the prior residuals into the same units.
+    chain_sigma [mm] is the one knob: how much of a view's disagreement is
+    blamed on the arm rather than on the board pose. rim_sigma_px only puts the
+    image and prior residuals into the same units.
     """
     if bias is None:
         bias = board_model.RIM_BIAS0
     if seed_board is None:
         seed_board = seed_pose(views, X0)
-    nv = len(views)
+
+    view_count = len(views)
     x = np.concatenate([unse3(seed_board)]
                        + ([unse3(X0)] if refine_x else [])
-                       + [np.zeros(6 * nv)])
-    o_xi = 6 + (6 if refine_x else 0)
+                       + [np.zeros(6 * view_count)])
+    slack_offset = 6 + (6 if refine_x else 0)
 
     # Lever arm turning a chain rotation into a displacement at the board, so
     # the prior is one number in mm rather than separate mm and deg guesses.
     # Both residual blocks are carried in units of their own sigma, so they are
     # directly comparable and the robust loss means the same thing in each.
-    lever = np.array([np.linalg.norm(v.seed[:3, 3]) for v in views])
-    w_prior = 1.0 / chain_sigma          # mm of board displacement -> sigmas
+    lever_arm = np.array([np.linalg.norm(view.seed[:3, 3]) for view in views])
 
-    def residuals(x, obs):
-        Tb, X, xi = unpack(x, views, refine_x, X0)
-        Xi = np.linalg.inv(X)
-        out = []
-        for i, (v, o) in enumerate(zip(views, obs)):
-            if len(o["idx"]) == 0:
+    def residuals(x, observations):
+        T_base_board, X, chain_slack = unpack(x, views, refine_x, X0)
+        X_inv = np.linalg.inv(X)
+        blocks = []
+        for view, slack, obs in zip(views, chain_slack, observations):
+            if len(obs["idx"]) == 0:
                 continue
-            T = Xi @ np.linalg.inv(v.T_fk @ se3(xi[i][:3], xi[i][3:6])) @ Tb
-            idx = o["idx"]
-            P = board_model.biased_pts(pts3[idx], nrm2[idx], level[idx],
-                                       T[:3, :3], T[:3, 3], bias)
-            a, _ = project_with_normals(P, nrm2[idx],
-                                        cv2.Rodrigues(T[:3, :3])[0].ravel(),
-                                        T[:3, 3], intr)
-            out.append(((a - o["q"]) * o["d"]).sum(1) / rim_sigma_px)
-        # prior: chain slack costs, in the same units, as a board displacement
-        pri = np.concatenate([
-            np.concatenate([xi[i][:3] * lever[i], xi[i][3:6]]) * 1000.0 * w_prior
-            for i in range(nv)])
-        out.append(pri)
-        return np.concatenate(out)
+            T_cam_board = _cam_board_pose(view, slack, X_inv, T_base_board)
+            blocks.append(_rim_residual(T_cam_board, obs, pts3, nrm2, level,
+                                        bias, intr) / rim_sigma_px)
+        blocks.append(_chain_prior_residual(chain_slack, lever_arm, chain_sigma))
+        return np.concatenate(blocks)
 
-    def sparsity(obs):
-        n = sum(len(o["idx"]) for o in obs) + 6 * nv
-        J = lil_matrix((n, len(x)), dtype=np.uint8)
-        r = 0
-        for i, o in enumerate(obs):
-            k = len(o["idx"])
-            if k == 0:
-                continue
-            J[r:r + k, :o_xi] = 1                       # board pose (and X)
-            J[r:r + k, o_xi + 6 * i:o_xi + 6 * i + 6] = 1
-            r += k
-        for i in range(nv):                             # prior rows
-            J[r + 6 * i:r + 6 * i + 6, o_xi + 6 * i:o_xi + 6 * i + 6] = 1
-        return J
+    def sparsity(observations):
+        return _jacobian_sparsity(observations, view_count, slack_offset, len(x))
 
-    sol = None
-    for it, S in enumerate(schedule):
+    for iteration, search_halfwidth in enumerate(schedule):
         apply_poses(x, views, refine_x, X0)
-        obs = measure(views, intr, pts3, nrm2, S, level, loop, bias)
-        sol = least_squares(residuals, x, jac_sparsity=sparsity(obs),
-                            loss="soft_l1", f_scale=2.5, method="trf",
-                            max_nfev=60, args=(obs,))
-        x = sol.x
+        observations = measure(views, intr, pts3, nrm2, search_halfwidth,
+                               level, loop, bias)
+        solution = least_squares(residuals, x,
+                                 jac_sparsity=sparsity(observations),
+                                 loss="soft_l1", f_scale=2.5, method="trf",
+                                 max_nfev=60, args=(observations,))
+        x = solution.x
         if verbose:
-            nrim = len(sol.fun) - 6 * nv
-            r = sol.fun[:nrim] * rim_sigma_px
-            _, _, xi = unpack(x, views, refine_x, X0)
-            slack = [np.linalg.norm(np.concatenate(
-                [z[:3] * lever[i], z[3:6]])) * 1000 for i, z in enumerate(xi)]
-            print(f"    iter {it} (S={S:2d})  n={nrim:6d}  "
-                  f"rms {np.sqrt((r ** 2).mean()):.3f} px  "
-                  f"mad {np.median(np.abs(r)):.3f} px  "
-                  f"in1px {(np.abs(r) < 1).mean():.2f}   "
-                  f"chain slack median {np.median(slack):.2f} mm")
+            _report_iteration(iteration, search_halfwidth, solution, views,
+                              refine_x, X0, lever_arm, rim_sigma_px)
 
     apply_poses(x, views, refine_x, X0)
-    Tb, X, xi = unpack(x, views, refine_x, X0)
-    slack = np.array([np.linalg.norm(np.concatenate(
-        [z[:3] * lever[i], z[3:6]])) * 1000 for i, z in enumerate(xi)])
-    return Tb, X, x, slack
+    T_base_board, X, chain_slack = unpack(x, views, refine_x, X0)
+    return T_base_board, X, x, _chain_slack_mm(chain_slack, lever_arm)
+
+
+def _rim_residual(T_cam_board, obs, pts3, nrm2, level, bias, intr):
+    """Signed distance from each measured edge to the projected rim, in px."""
+    idx = obs["idx"]
+    biased = board_model.biased_pts(pts3[idx], nrm2[idx], level[idx],
+                                    T_cam_board[:3, :3], T_cam_board[:3, 3], bias)
+    projected, _ = project_with_normals(
+        biased, nrm2[idx],
+        cv2.Rodrigues(T_cam_board[:3, :3])[0].ravel(), T_cam_board[:3, 3], intr)
+    return ((projected - obs["q"]) * obs["d"]).sum(1)
+
+
+def _chain_slack_mm(chain_slack, lever_arm):
+    """Each view's chain perturbation as one displacement at the board, mm."""
+    return np.array([
+        np.linalg.norm(np.concatenate([slack[:3] * lever, slack[3:6]])) * 1000
+        for slack, lever in zip(chain_slack, lever_arm)])
+
+
+def _chain_prior_residual(chain_slack, lever_arm, chain_sigma):
+    """Gaussian prior: chain slack costs in units of chain_sigma.
+
+    The reciprocal is formed once and multiplied, not divided per element --
+    the two differ in the last bits and the fit is sensitive enough to show it.
+    """
+    per_sigma = 1.0 / chain_sigma
+    scaled = [np.concatenate([slack[:3] * lever, slack[3:6]]) * 1000.0 * per_sigma
+              for slack, lever in zip(chain_slack, lever_arm)]
+    return np.concatenate(scaled)
+
+
+def _jacobian_sparsity(observations, view_count, slack_offset, param_count):
+    """Each view's rows touch the shared pose (and X) plus only its own slack."""
+    row_count = sum(len(obs["idx"]) for obs in observations) + 6 * view_count
+    pattern = lil_matrix((row_count, param_count), dtype=np.uint8)
+
+    row = 0
+    for i, obs in enumerate(observations):
+        rows_here = len(obs["idx"])
+        if rows_here == 0:
+            continue
+        pattern[row:row + rows_here, :slack_offset] = 1
+        pattern[row:row + rows_here,
+                slack_offset + 6 * i:slack_offset + 6 * i + 6] = 1
+        row += rows_here
+
+    for i in range(view_count):
+        pattern[row + 6 * i:row + 6 * i + 6,
+                slack_offset + 6 * i:slack_offset + 6 * i + 6] = 1
+    return pattern
+
+
+def _report_iteration(iteration, search_halfwidth, solution, views, refine_x,
+                      X0, lever_arm, rim_sigma_px):
+    rim_row_count = len(solution.fun) - 6 * len(views)
+    residual_px = solution.fun[:rim_row_count] * rim_sigma_px
+    _, _, chain_slack = unpack(solution.x, views, refine_x, X0)
+    slack_mm = _chain_slack_mm(chain_slack, lever_arm)
+    print(f"    iter {iteration} (S={search_halfwidth:2d})  "
+          f"n={rim_row_count:6d}  "
+          f"rms {np.sqrt((residual_px ** 2).mean()):.3f} px  "
+          f"mad {np.median(np.abs(residual_px)):.3f} px  "
+          f"in1px {(np.abs(residual_px) < 1).mean():.2f}   "
+          f"chain slack median {np.median(slack_mm):.2f} mm")
 
 
 # ------------------------------------------------------------------ reporting
 
 def corner_delta(Ta, Tb):
     """RMS displacement of the four board corners between two poses, mm."""
-    a = CORNERS @ Ta[:3, :3].T + Ta[:3, 3]
-    b = CORNERS @ Tb[:3, :3].T + Tb[:3, 3]
-    return float(np.sqrt(((a - b) ** 2).sum(1).mean()) * 1000)
+    rms_mm, _ = corner_spread_mm(board_corners(Ta) - board_corners(Tb))
+    return rms_mm
 
 
 def pose_delta(Ta, Tb):
@@ -335,15 +414,10 @@ def pose_delta(Ta, Tb):
 
 def average_per_view(views, X0):
     """The old way: push each view's own pose through the chain and average."""
-    Ts = [v.T_fk @ X0 @ v.seed for v in views]
-    M = np.eye(4)
-    U, _, Vt = np.linalg.svd(sum(T[:3, :3] for T in Ts))
-    M[:3, :3] = U @ Vt
-    if np.linalg.det(M[:3, :3]) < 0:
-        U[:, -1] *= -1; M[:3, :3] = U @ Vt
-    M[:3, 3] = np.median([T[:3, 3] for T in Ts], axis=0)
-    scatter = [corner_delta(T, M) for T in Ts]
-    return M, np.array(scatter)
+    per_view = _chain_poses(views, X0)
+    averaged = average_pose(per_view)
+    scatter_mm = [corner_delta(T, averaged) for T in per_view]
+    return averaged, np.array(scatter_mm)
 
 
 def halves(views):
@@ -356,6 +430,91 @@ def halves(views):
 
 
 # ------------------------------------------------------------------------ CLI
+
+def _hand_eye_is_identifiable(views, min_rotation_deg=15.0):
+    """X is only identifiable if the wrist actually rotated between views."""
+    rotations_deg = []
+    for i in range(len(views)):
+        for j in range(i + 1, len(views)):
+            relative = views[i].T_fk[:3, :3].T @ views[j].T_fk[:3, :3]
+            rotations_deg.append(np.degrees(np.arccos(
+                np.clip((np.trace(relative) - 1) / 2, -1, 1))))
+
+    widest_deg = max(rotations_deg)
+    if widest_deg < min_rotation_deg:
+        print(f"  refusing --refine-x: max relative rotation between views "
+              f"is {widest_deg:.1f} deg, so X is not identifiable here. "
+              f"Using the calibrated X.")
+        return False
+
+    print(f"  --refine-x: max relative rotation {widest_deg:.1f} deg, "
+          f"X is identifiable")
+    return True
+
+
+def _report_per_view_residuals(views, intr, pts3, nrm2, level, loop, bias):
+    """How well each view is served by the single shared pose."""
+    observations = measure(views, intr, pts3, nrm2, 4, level, loop, bias)
+    print("\n  per-view rim residual under the shared pose:")
+    for view, obs in zip(views, observations):
+        biased = board_model.biased_pts(
+            pts3[obs["idx"]], nrm2[obs["idx"]], level[obs["idx"]],
+            cv2.Rodrigues(view.rvec)[0], view.tvec, bias)
+        projected, _ = project_with_normals(biased, nrm2[obs["idx"]],
+                                            view.rvec, view.tvec, intr)
+        residual_px = ((projected - obs["q"]) * obs["d"]).sum(1)
+        print(f"    {view.name:20} n {len(residual_px):5d}  "
+              f"mad {np.median(np.abs(residual_px)):5.3f} px"
+              f"  in1px {(np.abs(residual_px) < 1).mean():4.2f}  "
+              f"({view.radius_px:4.0f} px off axis)")
+
+
+def _print_board_pose(T_base_board):
+    print("T_base_board =")
+    for row in T_base_board:
+        print("  [" + "  ".join(f"{value:+12.6f}" for value in row) + "]")
+    translation_mm = T_base_board[:3, 3] * 1000
+    rotation_deg = np.degrees(cv2.Rodrigues(T_base_board[:3, :3])[0].ravel())
+    print(f"  translation [{translation_mm[0]:+9.3f} {translation_mm[1]:+9.3f} "
+          f"{translation_mm[2]:+9.3f}] mm")
+    print(f"  rotation    [{rotation_deg[0]:+9.3f} {rotation_deg[1]:+9.3f} "
+          f"{rotation_deg[2]:+9.3f}] deg")
+
+
+def _run_split_half(views, intr, X0, pts3, nrm2, level, loop, bias,
+                    refine_x, chain_sigma):
+    """Fit two disjoint halves independently and compare. No ground truth."""
+    print("\n" + "=" * 72)
+    print("split-half validation: two disjoint halves of the views, fitted")
+    print("independently. No ground truth is involved.")
+    half_a, half_b = halves(views)
+
+    print(f"\n  half A ({len(half_a)} views)")
+    T_a, _, _, _ = solve(half_a, intr, X0, pts3, nrm2, level, loop, bias,
+                         refine_x=refine_x, chain_sigma=chain_sigma,
+                         verbose=False)
+    print(f"  half B ({len(half_b)} views)")
+    T_b, _, _, _ = solve(half_b, intr, X0, pts3, nrm2, level, loop, bias,
+                         refine_x=refine_x, chain_sigma=chain_sigma,
+                         verbose=False)
+    joint = pose_delta(T_a, T_b)
+
+    averaged_a, _ = average_per_view(half_a, X0)
+    averaged_b, _ = average_per_view(half_b, X0)
+    averaged = pose_delta(averaged_a, averaged_b)
+
+    print("\n  half-vs-half disagreement (2x the precision of each half):")
+    print(f"    averaged per-view poses : {averaged[0]:6.3f} mm at the corner   "
+          f"({averaged[1]:.3f} mm, {averaged[2]:.4f} deg)")
+    print(f"    joint multi-view fit    : {joint[0]:6.3f} mm at the corner   "
+          f"({joint[1]:.3f} mm, {joint[2]:.4f} deg)")
+    if joint[0] > 0:
+        print(f"    -> {averaged[0] / joint[0]:.2f}x better")
+
+    return {"joint_fit_mm": joint[0], "avg_per_view_mm": averaged[0],
+            "joint_fit_trans_mm": joint[1], "joint_fit_rot_deg": joint[2],
+            "avg_trans_mm": averaged[1], "avg_rot_deg": averaged[2]}
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -404,21 +563,7 @@ def main():
           f"({time.time() - t0:.0f}s to load)")
 
     if args.refine_x:
-        # X is only identifiable if the wrist actually rotated between views.
-        ang = []
-        for i in range(len(views)):
-            for j in range(i + 1, len(views)):
-                dR = views[i].T_fk[:3, :3].T @ views[j].T_fk[:3, :3]
-                ang.append(np.degrees(np.arccos(
-                    np.clip((np.trace(dR) - 1) / 2, -1, 1))))
-        if max(ang) < 15.0:
-            print(f"  refusing --refine-x: max relative rotation between views "
-                  f"is {max(ang):.1f} deg, so X is not identifiable here. "
-                  f"Using the calibrated X.")
-            args.refine_x = False
-        else:
-            print(f"  --refine-x: max relative rotation {max(ang):.1f} deg, "
-                  f"X is identifiable")
+        args.refine_x = _hand_eye_is_identifiable(views)
 
     # the old way, for comparison
     M_avg, scatter = average_per_view(views, X0)
@@ -436,16 +581,7 @@ def main():
     print(f"\n  joint fit vs averaged per-view poses: {d[0]:.3f} mm at the "
           f"corner  ({d[1]:.3f} mm translation, {d[2]:.4f} deg rotation)")
 
-    # residual of each view under the single shared pose
-    obs = measure(views, intr, pts3, nrm2, 4, level, loop, bias)
-    print("\n  per-view rim residual under the shared pose:")
-    for v, o in zip(views, obs):
-        P = board_model.biased_pts(pts3[o["idx"]], nrm2[o["idx"]], level[o["idx"]],
-                                   cv2.Rodrigues(v.rvec)[0], v.tvec, bias)
-        a, _ = project_with_normals(P, nrm2[o["idx"]], v.rvec, v.tvec, intr)
-        r = ((a - o["q"]) * o["d"]).sum(1)
-        print(f"    {v.name:20} n {len(r):5d}  mad {np.median(np.abs(r)):5.3f} px"
-              f"  in1px {(np.abs(r) < 1).mean():4.2f}  ({v.radius_px:4.0f} px off axis)")
+    _report_per_view_residuals(views, intr, pts3, nrm2, level, loop, bias)
 
     # put the base mounting transform back, so the answer is in the frame the
     # folder's own pose.txt uses
@@ -455,13 +591,7 @@ def main():
     frame = jv[0][5] if jv else "?"
     print(f"\nbase mounting transform recovered from this folder "
           f"(scatter {np.median(sc):.3f} mm), frame '{frame}'")
-    print("T_base_board =")
-    for row in T_base_board:
-        print("  [" + "  ".join(f"{c:+12.6f}" for c in row) + "]")
-    t = T_base_board[:3, 3] * 1000
-    rv = np.degrees(cv2.Rodrigues(T_base_board[:3, :3])[0].ravel())
-    print(f"  translation [{t[0]:+9.3f} {t[1]:+9.3f} {t[2]:+9.3f}] mm")
-    print(f"  rotation    [{rv[0]:+9.3f} {rv[1]:+9.3f} {rv[2]:+9.3f}] deg")
+    _print_board_pose(T_base_board)
 
     result = {"pose": args.pose, "n_views": len(views),
               "views": [v.name for v in views],
@@ -476,36 +606,9 @@ def main():
                                "scatter_mm": list(map(float, scatter))}}
 
     if args.split_half:
-        print("\n" + "=" * 72)
-        print("split-half validation: two disjoint halves of the views, fitted")
-        print("independently. No ground truth is involved.")
-        A, Bv = halves(views)
-        print(f"\n  half A ({len(A)} views)")
-        Ta, _, _, _ = solve(A, intr, X0, pts3, nrm2, level, loop, bias,
-                            refine_x=args.refine_x, chain_sigma=chain_sigma,
-                            verbose=False)
-        print(f"  half B ({len(Bv)} views)")
-        Tbb, _, _, _ = solve(Bv, intr, X0, pts3, nrm2, level, loop, bias,
-                             refine_x=args.refine_x, chain_sigma=chain_sigma,
-                             verbose=False)
-        dj = pose_delta(Ta, Tbb)
-
-        Ma, _ = average_per_view(A, X0)
-        Mbv, _ = average_per_view(Bv, X0)
-        da = pose_delta(Ma, Mbv)
-
-        print(f"\n  half-vs-half disagreement (2x the precision of each half):")
-        print(f"    averaged per-view poses : {da[0]:6.3f} mm at the corner   "
-              f"({da[1]:.3f} mm, {da[2]:.4f} deg)")
-        print(f"    joint multi-view fit    : {dj[0]:6.3f} mm at the corner   "
-              f"({dj[1]:.3f} mm, {dj[2]:.4f} deg)")
-        if dj[0] > 0:
-            print(f"    -> {da[0] / dj[0]:.2f}x better")
-        result["split_half"] = {"joint_fit_mm": dj[0],
-                                "avg_per_view_mm": da[0],
-                                "joint_fit_trans_mm": dj[1],
-                                "joint_fit_rot_deg": dj[2],
-                                "avg_trans_mm": da[1], "avg_rot_deg": da[2]}
+        result["split_half"] = _run_split_half(
+            views, intr, X0, pts3, nrm2, level, loop, bias,
+            args.refine_x, chain_sigma)
 
     out = args.out or str(HERE / "out" / f"board_multiview_pose_{args.pose}.json")
     json.dump(result, open(out, "w"), indent=2)

@@ -57,6 +57,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from scipy.optimize import minimize
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -255,12 +256,15 @@ def polish(dt, P, Rp, tp, n, par, maxiter=180):
     (~44M candidates would be needed). Polishing each candidate first removes
     the artefact for a few hundred cheap evaluations.
     """
-    from scipy.optimize import minimize
-    z0 = np.asarray(par, float) / POLISH_SCALE
-    f = lambda z: chamfer_cost(dt, P, Rp, tp, n, z * POLISH_SCALE)  # noqa: E731
-    r = minimize(f, z0, method="Nelder-Mead",
-                 options={"maxiter": maxiter, "xatol": 0.02, "fatol": 1e-3})
-    return r.x * POLISH_SCALE, float(r.fun)
+    scaled_seed = np.asarray(par, float) / POLISH_SCALE
+
+    def cost(scaled):
+        return chamfer_cost(dt, P, Rp, tp, n, scaled * POLISH_SCALE)
+
+    result = minimize(cost, scaled_seed, method="Nelder-Mead",
+                      options={"maxiter": maxiter, "xatol": 0.02,
+                               "fatol": 1e-3})
+    return result.x * POLISH_SCALE, float(result.fun)
 
 
 def _project(P3, R, t):
@@ -268,6 +272,49 @@ def _project(P3, R, t):
     z = np.maximum(X[..., 2], 1e-6)
     return np.stack([K_4K[0, 0] * X[..., 0] / z + K_4K[0, 2],
                      K_4K[1, 1] * X[..., 1] / z + K_4K[1, 2]], -1)
+
+
+def _yaw_rotation(Rp, yaw):
+    """Plane frame rotated about its own normal."""
+    cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+    return Rp @ np.array([[cos_y, -sin_y, 0],
+                          [sin_y, cos_y, 0],
+                          [0, 0, 1.0]])
+
+
+def _score_uv_grid(dt, rotated_points, centres, width, height):
+    """Chamfer score for every (u, v) offset at once; inf when too clipped.
+
+    Robust like a median: a handful of points always land on a specular glint
+    or an occluded pocket wall, and under a mean those few cost more than a
+    better alignment can win back. Normalised by the in-frame count, so a
+    correct pose on a partly clipped board is not charged the clip value for
+    every point off the sensor.
+    """
+    placed = rotated_points[None, :, :] + centres[:, None, :]
+    depth = np.maximum(placed[..., 2], 1e-6)
+    x = np.rint(K_4K[0, 0] * placed[..., 0] / depth + K_4K[0, 2]).astype(np.int32)
+    y = np.rint(K_4K[1, 1] * placed[..., 1] / depth + K_4K[1, 2]).astype(np.int32)
+
+    in_frame = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+    np.clip(x, 0, width - 1, out=x)
+    np.clip(y, 0, height - 1, out=y)
+
+    distance = np.where(in_frame, np.minimum(dt[y, x], CHAMFER_CLIP),
+                        CHAMFER_CLIP)
+    return np.where(in_frame.mean(1) > MIN_IN_FRAME,
+                    np.median(distance, axis=1), np.inf)
+
+
+def _best_of_grid(score, UV, yaw, height, keep=40):
+    """The `keep` best-scoring (u, v) cells at one (yaw, height)."""
+    best = []
+    for k in np.argsort(score)[:keep]:
+        if not np.isfinite(score[k]):
+            continue
+        best.append((float(score[k]), float(yaw),
+                     float(UV[k, 0]), float(UV[k, 1]), float(height)))
+    return best
 
 
 def search(dt, Rp, tp, n, yaw_step=2.0, uv_span=0.16, uv_step=0.010,
@@ -309,27 +356,15 @@ def search(dt, Rp, tp, n, yaw_step=2.0, uv_span=0.16, uv_step=0.010,
     UV = np.stack([U.ravel(), V.ravel()], 1)              # n_uv x 2
     base = tp + UV[:, 0:1] * Rp[:, 0] + UV[:, 1:2] * Rp[:, 1]
 
-    out = []
+    candidates = []
     for yaw in np.arange(0, 360, yaw_step) * DEG:
-        c, s = np.cos(yaw), np.sin(yaw)
-        R = Rp @ np.array([[c, -s, 0], [s, c, 0], [0, 0, 1.0]])
-        X = P @ R.T                                       # n_pts x 3
-        for h in h_range:
-            T = base + h * n
-            Xa = X[None, :, :] + T[:, None, :]            # n_uv x n_pts x 3
-            z = np.maximum(Xa[..., 2], 1e-6)
-            x = np.rint(K_4K[0, 0] * Xa[..., 0] / z + K_4K[0, 2]).astype(np.int32)
-            y = np.rint(K_4K[1, 1] * Xa[..., 1] / z + K_4K[1, 2]).astype(np.int32)
-            inb = (x >= 0) & (x < W) & (y >= 0) & (y < Hh)
-            np.clip(x, 0, W - 1, out=x); np.clip(y, 0, Hh - 1, out=y)
-            val = np.where(inb, np.minimum(dt[y, x], CHAMFER_CLIP), CHAMFER_CLIP)
-            score = np.where(inb.mean(1) > MIN_IN_FRAME,
-                             np.median(val, axis=1), np.inf)
-            for k in np.argsort(score)[:40]:
-                if np.isfinite(score[k]):
-                    out.append((float(score[k]), float(yaw),
-                                float(UV[k, 0]), float(UV[k, 1]), float(h)))
-    out.sort(key=lambda o: o[0])
+        rotated = P @ _yaw_rotation(Rp, yaw).T            # n_pts x 3
+        for height in h_range:
+            centres = base + height * n
+            score = _score_uv_grid(dt, rotated, centres, W, Hh)
+            candidates += _best_of_grid(score, UV, yaw, height)
+    candidates.sort(key=lambda candidate: candidate[0])
+    out = candidates
 
     # Keep the best candidate in each yaw bin, then take the best `topk` bins.
     #
@@ -402,6 +437,18 @@ def seed_view(view_dir, topk=20, yaw_step=2.0, uv_step=0.010):
                 "best_chamfer": round(cands[0][0], 2) if cands else None}
 
 
+def _all_view_names(data):
+    """Every pose_N/timestamp directory pair under `data`."""
+    names = []
+    for pose_dir in data.glob("pose_*"):
+        if not pose_dir.is_dir():
+            continue
+        for view_dir in sorted(pose_dir.iterdir()):
+            if view_dir.is_dir():
+                names.append(f"{pose_dir.name}/{view_dir.name}")
+    return names
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("views", nargs="*", help="pose_N/timestamp; default all")
@@ -409,9 +456,9 @@ def main():
     args = ap.parse_args()
     data = ROOT / "images" / "images_depth"
     views = args.views or sorted(
-        (f"{p.name}/{v.name}" for p in data.glob("pose_*") if p.is_dir()
-         for v in sorted(p.iterdir()) if v.is_dir()),
-        key=lambda s: (int(s.split("/")[0].split("_")[1]), s.split("/")[1]))
+        _all_view_names(data),
+        key=lambda name: (int(name.split("/")[0].split("_")[1]),
+                          name.split("/")[1]))
     res = {}
     for v in views:
         Ts, info = seed_view(data / v)

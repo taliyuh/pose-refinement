@@ -57,19 +57,30 @@ def detect(src, cache_p, gate=1.2, thresh=FLIP_MM):
     out = []
     for p in sorted(groups):
         items = groups[p]
-        Ts = [t for _, t, _, _ in items]
-        mads = np.array([m if m is not None else 9.0 for _, _, m, _ in items])
-        ok = mads <= gate
-        C = BS.consensus([T for T, k in zip(Ts, ok) if k]
-                         if ok.sum() >= 3 else Ts)
-        for (v, T, m, Tc), d in zip(items,
-                                    [BS.corner_dev(T, C) for T in Ts]):
-            if d >= thresh:
-                ang, az = BS.yaw_about_normal(T, C)
-                out.append({"pose": p, "view": v, "dev_mm": float(d),
-                            "rot_deg": float(ang), "axis_z": float(az),
-                            "mad_px": m})
+        consensus_pose = BS.consensus(_trusted_poses(items, gate))
+        for view_name, pose, mad_px, _ in items:
+            deviation_mm = BS.corner_dev(pose, consensus_pose)
+            if deviation_mm < thresh:
+                continue
+            angle_deg, axis_z = BS.yaw_about_normal(pose, consensus_pose)
+            out.append({"pose": p, "view": view_name,
+                        "dev_mm": float(deviation_mm),
+                        "rot_deg": float(angle_deg), "axis_z": float(axis_z),
+                        "mad_px": mad_px})
     return out
+
+
+def _trusted_poses(items, gate):
+    """Poses the per-view fit trusts; falls back to all if too few qualify."""
+    trusted = []
+    for _, pose, mad_px, _ in items:
+        residual = 9.0 if mad_px is None else mad_px
+        if residual <= gate:
+            trusted.append(pose)
+
+    if len(trusted) >= 3:
+        return trusted
+    return [pose for _, pose, _, _ in items]
 
 
 def refit(pose, view, T_cam_board, data):

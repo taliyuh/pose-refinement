@@ -84,41 +84,71 @@ def refine(gx, gy, P3, N2, lvl, loop, x0, schedule=(24, 12, 6, 4, 4),
     Floor-rim points hidden behind the pocket wall are culled every round, since
     which of them are visible depends on the pose being estimated.
     """
-    x = np.array(x0, float)
+    pose = np.array(x0, float)
     info = None
-    for S in schedule:
-        R, t = RT(x)
-        vis = (board_model.visible(P3, N2, lvl, loop, R, t)
-               if two_level else np.ones(len(P3), bool))
-        if vis.sum() < 100:
-            return x, None
-        idx = np.nonzero(vis)[0]
-        pm, d = rim_points(P3[idx], N2[idx], R, t)
-        off, peak, ok = edge_search(gx, gy, pm, d, S)
-        if ok.sum() < 100:
-            return x, None
-        ok &= peak >= np.percentile(peak[ok], 25)
-        if ok.sum() < 100:
-            return x, None
-        sub = idx[ok]
-        q = (pm + off[:, None] * d)[ok]
-        dq = d[ok]
+    for search_halfwidth in schedule:
+        edges = _associate_edges(gx, gy, P3, N2, lvl, loop, pose,
+                                 search_halfwidth, two_level)
+        if edges is None:
+            return pose, None
 
-        def res(z):
-            Rz, tz = RT(z)
-            a, _ = rim_points(P3[sub], N2[sub], Rz, tz)
-            return ((a - q) * dq).sum(1)
+        point_idx, edge_xy, edge_normal = edges
 
-        sol = least_squares(res, x, loss="soft_l1", f_scale=2.0,
-                            x_scale=[0.01, 0.01, 0.01, 0.002, 0.002, 0.002],
-                            max_nfev=80)
-        x = sol.x
-        r = sol.fun
-        info = {"n": int(len(sub)),
-                "rms_px": float(np.sqrt((r ** 2).mean())),
-                "mad_px": float(np.median(np.abs(r))),
-                "inlier_frac_1px": float((np.abs(r) < 1).mean())}
-    return x, info
+        def res(candidate):
+            R_candidate, t_candidate = RT(candidate)
+            projected, _ = rim_points(P3[point_idx], N2[point_idx],
+                                      R_candidate, t_candidate)
+            return ((projected - edge_xy) * edge_normal).sum(1)
+
+        solution = least_squares(res, pose, loss="soft_l1", f_scale=2.0,
+                                 x_scale=[0.01, 0.01, 0.01,
+                                          0.002, 0.002, 0.002],
+                                 max_nfev=80)
+        pose = solution.x
+        info = _fit_quality(len(point_idx), solution.fun)
+    return pose, info
+
+
+MIN_RIM_POINTS = 100
+
+
+def _associate_edges(gx, gy, P3, N2, lvl, loop, pose, search_halfwidth,
+                     two_level):
+    """(point indices, edge points, edge normals), or None if too few survive.
+
+    Floor-rim points hidden behind the pocket wall are culled every round,
+    since which of them are visible depends on the pose being estimated.
+    """
+    R, t = RT(pose)
+    if two_level:
+        is_visible = board_model.visible(P3, N2, lvl, loop, R, t)
+    else:
+        is_visible = np.ones(len(P3), bool)
+    if is_visible.sum() < MIN_RIM_POINTS:
+        return None
+
+    visible_idx = np.nonzero(is_visible)[0]
+    projected, normal = rim_points(P3[visible_idx], N2[visible_idx], R, t)
+    offset, peak, is_usable = edge_search(gx, gy, projected, normal,
+                                          search_halfwidth)
+    if is_usable.sum() < MIN_RIM_POINTS:
+        return None
+
+    # Drop the weakest quarter: a rim point on a faint gradient is a worse
+    # observation than no observation at all.
+    is_usable &= peak >= np.percentile(peak[is_usable], 25)
+    if is_usable.sum() < MIN_RIM_POINTS:
+        return None
+
+    edge_xy = (projected + offset[:, None] * normal)[is_usable]
+    return visible_idx[is_usable], edge_xy, normal[is_usable]
+
+
+def _fit_quality(point_count, residual_px):
+    return {"n": int(point_count),
+            "rms_px": float(np.sqrt((residual_px ** 2).mean())),
+            "mad_px": float(np.median(np.abs(residual_px))),
+            "inlier_frac_1px": float((np.abs(residual_px) < 1).mean())}
 
 
 def fit_view(view_dir, topk=20, two_level=True, verbose=False,
@@ -167,6 +197,45 @@ def fit_view(view_dir, topk=20, two_level=True, verbose=False,
     return binfo
 
 
+def _view_key(view_name):
+    """(pose number, timestamp) for sorting and for matching finished rows."""
+    pose_dir, timestamp = view_name.split("/")
+    return int(pose_dir.split("_")[1]), timestamp
+
+
+def _all_view_names(data):
+    """Every pose_N/timestamp under `data`, in capture order."""
+    names = []
+    for pose_dir in data.glob("pose_*"):
+        if not pose_dir.is_dir():
+            continue
+        for view_dir in sorted(pose_dir.iterdir()):
+            if view_dir.is_dir():
+                names.append(f"{pose_dir.name}/{view_dir.name}")
+    return sorted(names, key=_view_key)
+
+
+def _views_still_to_do(views, finished_rows):
+    """Views with no row yet, so a killed run resumes instead of restarting."""
+    done = set()
+    for row in finished_rows:
+        done.add((row["pose"], row["view"]))
+
+    remaining = []
+    for view_name in views:
+        if _view_key(view_name) not in done:
+            remaining.append(view_name)
+    return remaining
+
+
+def _residuals_for_pose(rows, pose):
+    residuals = []
+    for row in rows:
+        if row["pose"] == pose:
+            residuals.append(row["mad_px"])
+    return residuals
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("views", nargs="*", help="pose_N/timestamp; default all")
@@ -182,10 +251,7 @@ def main():
     args = ap.parse_args()
 
     data = ROOT / "images" / "images_depth"
-    views = args.views or sorted(
-        (f"{p.name}/{v.name}" for p in data.glob("pose_*") if p.is_dir()
-         for v in sorted(p.iterdir()) if v.is_dir()),
-        key=lambda s: (int(s.split("/")[0].split("_")[1]), s.split("/")[1]))
+    views = args.views or _all_view_names(data)
     if args.limit:
         views = views[:args.limit]
 
@@ -199,10 +265,7 @@ def main():
     if out_p.exists() and not args.restart:
         try:
             rows = json.load(open(out_p))
-            done = {(r["pose"], r["view"]) for r in rows}
-            views = [v for v in views
-                     if (int(v.split("/")[0].split("_")[1]), v.split("/")[1])
-                     not in done]
+            views = _views_still_to_do(views, rows)
             print(f"resuming: {len(rows)} views already in {out_p.name}, "
                   f"{len(views)} to go")
         except (ValueError, KeyError):
@@ -233,7 +296,7 @@ def main():
           f"mad median {np.median(m):.2f} px  p90 {np.percentile(m,90):.2f}  "
           f"pass<1.0 {(m<1.0).sum()}/{len(m)}")
     for p in sorted({r["pose"] for r in rows}):
-        s = np.array([r["mad_px"] for r in rows if r["pose"] == p])
+        s = np.array(_residuals_for_pose(rows, p))
         print(f"  pose_{p:<3} n={len(s):3d}  median {np.median(s):5.2f}  "
               f"pass<1.0 {(s<1.0).sum():3d}")
     print(f"\nwrote {args.out}")

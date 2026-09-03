@@ -25,35 +25,50 @@ STL = Path(__file__).resolve().parent.parent / "nist_atb_m1.stl"
 Z_TOP = 0.025          # m, board top face (matches CORNER_3D)
 SPACING = 0.0010       # m, arc-length resampling of each rim
 
+RIM_BIAS_NAMES = ["b0_top", "b0_floor", "b1_top", "b1_floor",
+                  "b2_top", "b2_floor", "b3_top", "b3_floor"]
+NBIAS = len(RIM_BIAS_NAMES)
 
-def _area(p):
-    x, y = p[:, 0], p[:, 1]
-    return 0.5 * (np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
-
-
-def _resample(p, spacing):
-    """Uniform arc-length resampling of a closed polygon."""
-    q = np.vstack([p, p[:1]])
-    seg = np.linalg.norm(np.diff(q, axis=0), axis=1)
-    s = np.concatenate([[0], np.cumsum(seg)])
-    n = max(24, int(round(s[-1] / spacing)))
-    t = np.linspace(0, s[-1], n, endpoint=False)
-    return np.stack([np.interp(t, s, q[:, 0]), np.interp(t, s, q[:, 1])], 1)
-
+# Calibrated by bundle_rims.py; see rim_bias(). Metres of offset along each
+# rim's outward in-plane normal. b1 is held at zero on purpose -- it is
+# fittable and must not be fitted, see WHY b1 IS ZERO.
+RIM_BIAS0 = np.array([1.604e-4, -1.124e-4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 _MESH = None
 _CACHE = {}
 
 
+def _signed_area(polygon):
+    """Shoelace area; the SIGN carries the winding direction."""
+    x, y = polygon[:, 0], polygon[:, 1]
+    return 0.5 * (np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+
+
+def _resample(polygon, spacing):
+    """Uniform arc-length resampling of a closed polygon."""
+    closed = np.vstack([polygon, polygon[:1]])
+    segment_lengths = np.linalg.norm(np.diff(closed, axis=0), axis=1)
+    arc_length = np.concatenate([[0], np.cumsum(segment_lengths)])
+    point_count = max(24, int(round(arc_length[-1] / spacing)))
+    wanted = np.linspace(0, arc_length[-1], point_count, endpoint=False)
+    return np.stack([np.interp(wanted, arc_length, closed[:, 0]),
+                     np.interp(wanted, arc_length, closed[:, 1])], 1)
+
+
+def _outward_normals(polygon, signed_area):
+    """Unit in-plane normals pointing out of the material, i.e. into the hole."""
+    tangents = np.roll(polygon, -1, 0) - np.roll(polygon, 1, 0)
+    tangents /= np.linalg.norm(tangents, axis=1, keepdims=True)
+    normals = np.stack([tangents[:, 1], -tangents[:, 0]], 1)
+    is_counter_clockwise = signed_area > 0
+    return -normals if is_counter_clockwise else normals
+
+
 def _mesh():
     """The STL, parsed once per process.
 
-    build() used to re-parse it on every call, and build_levels() calls build()
-    twice -- so a per-view fit paid for three trimesh loads plus three outline
-    extractions, 753 redundant parses over the 251-view run. Measured cost is
-    128 ms per parse, i.e. ~0.4 s of the 14.5 s per view (~3%); the run is
-    dominated by the chamfer search and the candidate refines, not by this.
-    Cached anyway because it is free to do.
+    Cached because build_levels() calls build() twice: 753 redundant parses at
+    128 ms over the 251-view run, ~3% of it.
     """
     global _MESH
     if _MESH is None:
@@ -70,34 +85,41 @@ def build(z_level=2.5, min_area=0.8, max_area=20.0, max_absy=10.0):
     key = (z_level, min_area, max_area, max_absy)
     if key in _CACHE:
         return tuple(a.copy() for a in _CACHE[key])
-    m = _mesh()
-    v, f = m.vertices, m.faces
-    face_on = np.all(np.abs(v[f][:, :, 2] - z_level) < 1e-6, axis=1)
-    path = m.outline(np.nonzero(face_on)[0])
+    rim_points, rim_normals, rim_ids = [], [], []
+    for contour in _contours_at_height(z_level):
+        signed_area = _signed_area(contour)
+        if not _is_hole_rim(contour, signed_area, min_area, max_area, max_absy):
+            continue
+        resampled = _resample(contour, SPACING * 100.0) / 100.0   # cm -> m
+        rim_points.append(resampled)
+        rim_normals.append(_outward_normals(resampled, signed_area))
+        rim_ids.append(np.full(len(resampled), len(rim_points) - 1))
 
-    pts, nrm, lid = [], [], []
-    for e in path.entities:
-        p = path.vertices[e.points][:, :2]
-        if len(p) < 8:
-            continue
-        A = _area(p)
-        if not (min_area <= abs(A) <= max_area):
-            continue
-        if abs(p.mean(0)[1]) > max_absy:     # drop the logo/text band
-            continue
-        q = _resample(p, SPACING * 100.0) / 100.0     # cm -> m
-        tan = np.roll(q, -1, 0) - np.roll(q, 1, 0)
-        tan /= np.linalg.norm(tan, axis=1, keepdims=True)
-        nn = np.stack([tan[:, 1], -tan[:, 0]], 1)     # right-hand perpendicular
-        if A > 0:                                     # CCW -> flip to outward
-            nn = -nn
-        k = len(pts)
-        pts.append(q); nrm.append(nn); lid.append(np.full(len(q), k))
-    if not pts:
+    if not rim_points:
         raise RuntimeError("no rims found")
-    out = (np.concatenate(pts), np.concatenate(nrm), np.concatenate(lid))
-    _CACHE[key] = out
-    return tuple(a.copy() for a in out)
+    rims = (np.concatenate(rim_points), np.concatenate(rim_normals),
+            np.concatenate(rim_ids))
+    _CACHE[key] = rims
+    return tuple(a.copy() for a in rims)
+
+
+def _contours_at_height(z_level):
+    """Closed xy polygons bounding the faces that lie flat at `z_level`."""
+    mesh = _mesh()
+    face_z = mesh.vertices[mesh.faces][:, :, 2]
+    is_flat_at_level = np.all(np.abs(face_z - z_level) < 1e-6, axis=1)
+    path = mesh.outline(np.nonzero(is_flat_at_level)[0])
+    return [path.vertices[entity.points][:, :2] for entity in path.entities]
+
+
+def _is_hole_rim(contour, signed_area, min_area, max_area, max_absy):
+    """Reject stray outlines: too few points, wrong size, or the logo band."""
+    if len(contour) < 8:
+        return False
+    if not (min_area <= abs(signed_area) <= max_area):
+        return False
+    is_in_logo_band = abs(contour.mean(0)[1]) > max_absy
+    return not is_in_logo_band
 
 
 def outline(z=Z_TOP):
@@ -107,62 +129,44 @@ def outline(z=Z_TOP):
     double edge up to 16 px apart at 4K -- but exact enough to DRAW, which is
     what makes board tracking checkable at a glance.
     """
-    b = _mesh().bounds[:, :2] / 100.0          # STL is in centimetres
-    (x0, y0), (x1, y1) = b[0], b[1]
-    q = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
-    return np.concatenate([q, np.full((4, 1), z)], 1)
+    bounds = _mesh().bounds[:, :2] / 100.0     # STL is in centimetres
+    (min_x, min_y), (max_x, max_y) = bounds[0], bounds[1]
+    corners = np.array([[min_x, min_y], [max_x, min_y],
+                        [max_x, max_y], [min_x, max_y]])
+    return np.concatenate([corners, np.full((4, 1), z)], 1)
 
 
 def pts3(pts2):
     return np.concatenate([pts2, np.full((len(pts2), 1), Z_TOP)], 1)
 
 
-if __name__ == "__main__":
-    p, n, l = build()
-    print(f"{l.max() + 1} rims, {len(p)} boundary points, "
-          f"spacing {SPACING * 1000:.1f} mm")
-    for k in range(int(l.max()) + 1):
-        q = p[l == k]
-        c = q.mean(0)
-        r = np.linalg.norm(q - c, axis=1)
-        print(f"  rim {k:2d}  n={len(q):4d}  centre ({c[0] * 1000:+8.2f},"
-              f"{c[1] * 1000:+8.2f}) mm   r {r.min() * 1000:5.2f}-{r.max() * 1000:5.2f} mm")
-
-
 def build_levels(levels=((2.5, 0.8), (0.3, 0.35))):
-    """Multi-level contours: the top rims AND the pocket floor rims.
+    """Top rims plus pocket-floor rims: (pts3 m, nrm2, level, loop).
 
-    The pockets are blind, 22 mm deep, with floors at z = 3 mm. Fitting only
-    the top rims makes the board a single plane, and a plane's out-of-plane
-    tilt is observable solely through perspective foreshortening -- weak at
-    320 mm across a 470 mm standoff, and strongly correlated with the
-    along-normal translation. The floor rims sit 22 mm below the top rims, so
-    including them turns tilt into a direct triangulation with a real baseline.
-
-    Returns (pts3 Nx3 metres, nrm2 Nx2 in-plane outward normals, level, loop).
+    The 22 mm baseline between the levels is the whole point. Top rims alone
+    make the board one plane, whose tilt is visible only through perspective
+    foreshortening -- weak over 320 mm at a 470 mm standoff, and strongly
+    correlated with the along-normal translation. The floors turn tilt into a
+    direct triangulation instead.
     """
-    P, N, L, G, base = [], [], [], [], 0
-    for li, (zc, min_area) in enumerate(levels):
-        p, n, g = build(z_level=zc, min_area=min_area)
-        z = zc / 100.0
-        P.append(np.concatenate([p, np.full((len(p), 1), z)], 1))
-        N.append(n); L.append(np.full(len(p), li)); G.append(g + base)
-        base += int(g.max()) + 1
-    return (np.concatenate(P), np.concatenate(N),
-            np.concatenate(L), np.concatenate(G))
+    points, normals, level_ids, loop_ids = [], [], [], []
+    loops_so_far = 0
+    for level_id, (z_centimetres, min_area) in enumerate(levels):
+        rim_xy, rim_normals, rim_loops = build(z_level=z_centimetres,
+                                               min_area=min_area)
+        z_metres = z_centimetres / 100.0
+        points.append(np.concatenate(
+            [rim_xy, np.full((len(rim_xy), 1), z_metres)], 1))
+        normals.append(rim_normals)
+        level_ids.append(np.full(len(rim_xy), level_id))
+        # Loop ids restart at 0 per level; offset them so they stay unique.
+        loop_ids.append(rim_loops + loops_so_far)
+        loops_so_far += int(rim_loops.max()) + 1
+    return (np.concatenate(points), np.concatenate(normals),
+            np.concatenate(level_ids), np.concatenate(loop_ids))
 
 
 # --------------------------------------------------------------- rim bias
-
-RIM_BIAS_NAMES = ["b0_top", "b0_floor", "b1_top", "b1_floor",
-                  "b2_top", "b2_floor", "b3_top", "b3_floor"]
-NBIAS = len(RIM_BIAS_NAMES)
-
-# Calibrated by bundle_rims.py; see rim_bias(). Units: metres of offset along
-# each rim's outward in-plane normal. b1 is held at zero on purpose -- it is
-# fittable and must not be fitted, see WHY b1 IS ZERO.
-RIM_BIAS0 = np.array([1.604e-4, -1.124e-4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-
 
 def pad_bias(b):
     """Accept a shorter bias vector (an older bundle) and zero-fill the rest."""
@@ -273,22 +277,28 @@ def rim_bias(pts3, nrm2, level, R, t, bias):
     absorbing pose, not measuring physics. bundle_rims.py --rim-bias b0b1 will
     still fit it, for anyone who wants to reproduce the finding.
     """
-    C = -R.T @ t                                   # camera centre, board frame
-    u = C[None, :] - pts3
-    u /= np.maximum(np.linalg.norm(u, axis=1, keepdims=True), 1e-12)
-    s = (u[:, :2] * nrm2).sum(1)
-    uxy = np.hypot(u[:, 0], u[:, 1])
-    b = pad_bias(bias)
-    return (b[0:2][level] + b[2:4][level] * s
-            + b[4:6][level] * np.abs(s) + b[6:8][level] * uxy)
+    camera_centre = -R.T @ t                       # board frame
+    view_direction = camera_centre[None, :] - pts3
+    view_direction /= np.maximum(
+        np.linalg.norm(view_direction, axis=1, keepdims=True), 1e-12)
+
+    # s says whether the sight line runs into this piece of wall or across it.
+    into_wall = (view_direction[:, :2] * nrm2).sum(1)
+    obliquity = np.hypot(view_direction[:, 0], view_direction[:, 1])
+
+    b0, b1, b2, b3 = pad_bias(bias).reshape(4, 2)
+    return (b0[level]
+            + b1[level] * into_wall
+            + b2[level] * np.abs(into_wall)
+            + b3[level] * obliquity)
 
 
 def biased_pts(pts3, nrm2, level, R, t, bias):
     """pts3 with each rim point pushed along its outward in-plane normal."""
-    d = rim_bias(pts3, nrm2, level, R, t, bias)
-    q = pts3.copy()
-    q[:, :2] += nrm2 * d[:, None]
-    return q
+    offset = rim_bias(pts3, nrm2, level, R, t, bias)
+    biased = pts3.copy()
+    biased[:, :2] += nrm2 * offset[:, None]
+    return biased
 
 
 def visible(pts3, nrm2, level, loop, R, t, z_shoulder=0.023):
@@ -298,27 +308,64 @@ def visible(pts3, nrm2, level, loop, R, t, z_shoulder=0.023):
     point is visible iff the ray to the camera is still inside the pocket
     cross-section when it reaches the shoulder.
     """
-    ok = np.ones(len(pts3), bool)
-    C = -R.T @ t                                   # camera centre, board frame
-    for li in np.unique(level):
-        if li == 0:
+    is_visible = np.ones(len(pts3), bool)
+    camera_centre = -R.T @ t                       # board frame
+    for level_id in np.unique(level):
+        if level_id == 0:                          # top rims are never occluded
             continue
-        for g in np.unique(loop[level == li]):
-            m = (level == li) & (loop == g)
-            p = pts3[m]
-            d = C[None, :] - p
-            with np.errstate(divide="ignore", invalid="ignore"):
-                s = (z_shoulder - p[:, 2]) / d[:, 2]
-            exit_xy = p[:, :2] + s[:, None] * d[:, :2]
-            # inside test against the pocket outline (its own xy polygon)
-            poly = p[:, :2]
-            c = poly.mean(0)
-            # a point is inside iff it is on the inner side of every edge
-            a, b = poly, np.roll(poly, -1, 0)
-            e = b - a
-            nrm = np.stack([e[:, 1], -e[:, 0]], 1)
-            if np.mean(((c - a) * nrm).sum(1)) < 0:
-                nrm = -nrm
-            inside = np.all(((exit_xy[:, None, :] - a[None]) * nrm[None]).sum(2) > 0, axis=1)
-            ok[m] = inside & (s > 0)
-    return ok
+        for loop_id in np.unique(loop[level == level_id]):
+            in_this_pocket = (level == level_id) & (loop == loop_id)
+            floor_points = pts3[in_this_pocket]
+            exit_xy, height_fraction = _ray_exit_at_shoulder(
+                floor_points, camera_centre, z_shoulder)
+            # The pocket's own floor outline IS its cross-section, so the ray
+            # clears the wall iff it is still inside that outline at the
+            # shoulder. A negative fraction means the shoulder is behind the
+            # camera, which is not a sight line at all.
+            clears_the_wall = _is_inside_polygon(exit_xy, floor_points[:, :2])
+            is_visible[in_this_pocket] = clears_the_wall & (height_fraction > 0)
+    return is_visible
+
+
+def _ray_exit_at_shoulder(points, camera_centre, z_shoulder):
+    """Where each point's sight line crosses the shoulder plane, and how far
+    along the ray that is as a fraction of the distance to the camera."""
+    to_camera = camera_centre[None, :] - points
+    with np.errstate(divide="ignore", invalid="ignore"):
+        height_fraction = (z_shoulder - points[:, 2]) / to_camera[:, 2]
+    exit_xy = points[:, :2] + height_fraction[:, None] * to_camera[:, :2]
+    return exit_xy, height_fraction
+
+
+def _is_inside_polygon(query_xy, polygon):
+    """Inside test for a convex polygon: on the inner side of every edge."""
+    edge_start = polygon
+    edge_vector = np.roll(polygon, -1, 0) - polygon
+    inward = np.stack([edge_vector[:, 1], -edge_vector[:, 0]], 1)
+
+    # The winding direction of the outline is not guaranteed, so orient the
+    # normals using the centroid, which is inside by construction.
+    centroid = polygon.mean(0)
+    if np.mean(((centroid - edge_start) * inward).sum(1)) < 0:
+        inward = -inward
+
+    signed_distance = ((query_xy[:, None, :] - edge_start[None]) * inward[None]).sum(2)
+    return np.all(signed_distance > 0, axis=1)
+
+
+def _print_rim_summary():
+    points, _, loop = build()
+    rim_count = int(loop.max()) + 1
+    print(f"{rim_count} rims, {len(points)} boundary points, "
+          f"spacing {SPACING * 1000:.1f} mm")
+    for rim_id in range(rim_count):
+        rim = points[loop == rim_id]
+        centre = rim.mean(0)
+        radius = np.linalg.norm(rim - centre, axis=1)
+        print(f"  rim {rim_id:2d}  n={len(rim):4d}  centre ({centre[0] * 1000:+8.2f},"
+              f"{centre[1] * 1000:+8.2f}) mm   "
+              f"r {radius.min() * 1000:5.2f}-{radius.max() * 1000:5.2f} mm")
+
+
+if __name__ == "__main__":
+    _print_rim_summary()
