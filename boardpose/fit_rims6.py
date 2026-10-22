@@ -62,12 +62,14 @@ def RT(x):
     return R, np.asarray(x[3:6], float)
 
 
-def rim_points(P3, N2, R, t):
+def rim_points(P3, N2, R, t, level=None, bias=None):
     """Projected rim points and the image direction of their outward normals.
 
     The normal is in-plane (the rims are planar curves at fixed z), so the 1 mm
     probe point is offset in x, y only.
     """
+    if bias is not None and level is not None:
+        P3 = board_model.biased_pts(P3, N2, level, R, t, bias)
     Q = P3.copy()
     Q[:, :2] += N2 * 1e-3
     a, b = project(P3, R, t), project(Q, R, t)
@@ -78,7 +80,9 @@ def rim_points(P3, N2, R, t):
 # ---------------------------------------------------------------- refinement
 
 def refine(gx, gy, P3, N2, lvl, loop, x0, schedule=(24, 12, 6, 4, 4),
-           two_level=True):
+           two_level=True, expected_center_px=None, center_weight=0.1,
+           pose_prior=None, pose_prior_weight=None, pose_prior_copies=0,
+           frozen_rim_bias=None):
     """Iterated subpixel edge search + 6-DoF Gauss-Newton, shrinking the radius.
 
     Floor-rim points hidden behind the pocket wall are culled every round, since
@@ -88,7 +92,7 @@ def refine(gx, gy, P3, N2, lvl, loop, x0, schedule=(24, 12, 6, 4, 4),
     info = None
     for search_halfwidth in schedule:
         edges = _associate_edges(gx, gy, P3, N2, lvl, loop, pose,
-                                 search_halfwidth, two_level)
+                                 search_halfwidth, two_level, frozen_rim_bias)
         if edges is None:
             return pose, None
 
@@ -97,23 +101,90 @@ def refine(gx, gy, P3, N2, lvl, loop, x0, schedule=(24, 12, 6, 4, 4),
         def res(candidate):
             R_candidate, t_candidate = RT(candidate)
             projected, _ = rim_points(P3[point_idx], N2[point_idx],
-                                      R_candidate, t_candidate)
-            return ((projected - edge_xy) * edge_normal).sum(1)
+                                      R_candidate, t_candidate, lvl[point_idx],
+                                      frozen_rim_bias)
+            rim_residual = ((projected - edge_xy) * edge_normal).sum(1)
+            residuals = [rim_residual]
+            if expected_center_px is not None:
+                board_center = project(np.array([[0.0, 0.0, 0.025]]),
+                                       R_candidate, t_candidate)[0]
+                centre_residual = center_weight * (board_center - expected_center_px)
+                # soft_l1 limits each residual's influence. Repeat the two-pixel
+                # location prior so a false high-contrast table edge cannot pull a
+                # bright-board seed hundreds of pixels away.
+                residuals.append(np.tile(centre_residual, CENTER_PRIOR_COPIES))
+            if pose_prior is not None:
+                prior_residual = ((candidate - pose_prior) * pose_prior_weight)
+                residuals.append(np.tile(prior_residual, pose_prior_copies))
+            return np.concatenate(residuals)
 
         solution = least_squares(res, pose, loss="soft_l1", f_scale=2.0,
                                  x_scale=[0.01, 0.01, 0.01,
                                           0.002, 0.002, 0.002],
                                  max_nfev=80)
         pose = solution.x
-        info = _fit_quality(len(point_idx), solution.fun)
+        info = _fit_quality(len(point_idx), solution.fun[:len(point_idx)])
     return pose, info
 
 
 MIN_RIM_POINTS = 100
+CENTER_PRIOR_COPIES = 100
+
+
+def fit_view_from_pose(view_dir, T_cam_board, two_level=True, progress=None,
+                       constrain=True, schedule=(24, 12, 6, 4, 4),
+                       prior_copies=5, frozen_rim_bias=None):
+    """Refine a view from a supplied board pose without global reseeding.
+
+    A rig constraint is useful only as a guard against a false secondary-camera
+    edge association.  Set ``constrain=False`` when this image pose is itself
+    evidence for calibrating that rig: then the supplied pose is only a seed.
+    """
+    view_dir = Path(view_dir)
+    image = cv2.imread(str(view_dir / "color.png"))
+    if image is None:
+        return None
+    image = cv2.undistort(image, K_4K.astype(np.float32), D_4K,
+                          newCameraMatrix=K_4K.astype(np.float32))
+    gray = cv2.GaussianBlur(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (0, 0), 1.6)
+    gx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+    if two_level:
+        P3, N2, level, loop = board_model.build_levels()
+    else:
+        points, N2, loop = board_model.build()
+        P3, level = board_model.pts3(points), np.zeros(len(points), int)
+
+    rotation, _ = cv2.Rodrigues(np.asarray(T_cam_board)[:3, :3])
+    initial_pose = np.concatenate([rotation.ravel(), np.asarray(T_cam_board)[:3, 3]])
+    if progress is not None:
+        stage = "rig-constrained" if constrain else "pose-seeded"
+        progress(f"{stage} subpixel rim refinement")
+    # A 1 mm translation or 0.1 degree rotation costs several pixels, but the
+    # edge observations may still make small corrections to a rig calibration.
+    pose_weight = np.array([3000.0, 3000.0, 3000.0,
+                            6000.0, 6000.0, 6000.0])
+    refine_kwargs = {}
+    if constrain:
+        refine_kwargs = {"pose_prior": initial_pose,
+                          "pose_prior_weight": pose_weight,
+                          "pose_prior_copies": prior_copies}
+    refined_pose, info = refine(gx, gy, P3, N2, level, loop, initial_pose,
+                                two_level=two_level, schedule=schedule,
+                                frozen_rim_bias=frozen_rim_bias,
+                                **refine_kwargs)
+    if info is None:
+        return None
+    R, t = RT(refined_pose)
+    transform = np.eye(4)
+    transform[:3, :3], transform[:3, 3] = R, t
+    method = "rig_prior" if constrain else "pose_seed"
+    info.update(T_cam_board=transform.tolist(), seed={"method": method})
+    return info
 
 
 def _associate_edges(gx, gy, P3, N2, lvl, loop, pose, search_halfwidth,
-                     two_level):
+                     two_level, frozen_rim_bias=None):
     """(point indices, edge points, edge normals), or None if too few survive.
 
     Floor-rim points hidden behind the pocket wall are culled every round,
@@ -128,7 +199,8 @@ def _associate_edges(gx, gy, P3, N2, lvl, loop, pose, search_halfwidth,
         return None
 
     visible_idx = np.nonzero(is_visible)[0]
-    projected, normal = rim_points(P3[visible_idx], N2[visible_idx], R, t)
+    projected, normal = rim_points(P3[visible_idx], N2[visible_idx], R, t,
+                                   lvl[visible_idx], frozen_rim_bias)
     offset, peak, is_usable = edge_search(gx, gy, projected, normal,
                                           search_halfwidth)
     if is_usable.sum() < MIN_RIM_POINTS:
@@ -152,7 +224,9 @@ def _fit_quality(point_count, residual_px):
 
 
 def fit_view(view_dir, topk=20, two_level=True, verbose=False,
-             yaw_step=2.0, uv_step=0.010):
+             yaw_step=2.0, uv_step=0.010, uv_span=0.16, progress=None,
+             bright_seed=False, bright_uv_span=0.18, return_candidates=False,
+             frozen_rim_bias=None):
     view_dir = Path(view_dir)
     img = cv2.imread(str(view_dir / "color.png"))
     if img is None:
@@ -169,18 +243,35 @@ def fit_view(view_dir, topk=20, two_level=True, verbose=False,
         p2, N2, loop = board_model.build()
         P3, lvl = board_model.pts3(p2), np.zeros(len(p2), int)
 
+    if progress is not None:
+        progress("loading image and depth")
     cands, sinfo = seed_board.seed_view(view_dir, topk=topk, yaw_step=yaw_step,
-                                        uv_step=uv_step)
+                                        uv_step=uv_step, uv_span=uv_span,
+                                        progress=progress, bright_seed=bright_seed,
+                                        bright_uv_span=bright_uv_span)
     if not cands:
         return None
 
     best, binfo, bscore = None, None, np.inf
-    for score, T in cands:
+    refined_candidates = []
+    for candidate_index, (score, T) in enumerate(cands, start=1):
+        if progress is not None:
+            progress(f"subpixel rim refinement {candidate_index}/{len(cands)}")
         rv, _ = cv2.Rodrigues(T[:3, :3])
         x0 = np.concatenate([rv.ravel(), T[:3, 3]])
-        x, info = refine(gx, gy, P3, N2, lvl, loop, x0, two_level=two_level)
+        expected_center_px = sinfo.get("bright_seed_px")
+        x, info = refine(gx, gy, P3, N2, lvl, loop, x0, two_level=two_level,
+                         expected_center_px=expected_center_px if bright_seed else None,
+                         frozen_rim_bias=frozen_rim_bias)
         if info is None:
             continue
+        candidate_R, candidate_t = RT(x)
+        candidate_T = np.eye(4)
+        candidate_T[:3, :3], candidate_T[:3, 3] = candidate_R, candidate_t
+        refined_candidates.append({"T_cam_board": candidate_T.tolist(),
+                                   "mad_px": info["mad_px"],
+                                   "rms_px": info["rms_px"],
+                                   "n": info["n"]})
         if verbose:
             print(f"      chamfer {score:5.2f} -> mad {info['mad_px']:5.2f} "
                   f"n {info['n']:4d}")
@@ -194,6 +285,8 @@ def fit_view(view_dir, topk=20, two_level=True, verbose=False,
     T = np.eye(4); T[:3, :3], T[:3, 3] = R, t
     binfo.update(T_cam_board=T.tolist(), seed=sinfo,
                  n_table=sinfo.get("plane_normal"))
+    if return_candidates:
+        binfo["candidates"] = refined_candidates
     return binfo
 
 

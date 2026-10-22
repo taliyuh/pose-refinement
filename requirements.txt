@@ -10,6 +10,7 @@ scipy==1.11.4
 opencv-contrib-python==4.11.0.86
 trimesh==5.0.0
 tqdm==4.70.0
+pyyaml==6.0.2        # franka_ws/pipeline reads the capture manifests
 
 # Capture only (boardpose/capture_board_view.py, boardpose/normalize_frames.py).
 # These come from the system ROS 2 install, NOT from pip -- run the capture

@@ -36,6 +36,162 @@ comes from your system install rather than pip.
 
 ## The workflow
 
+### Stationary single-camera workflow
+
+The stationary refiner also supports one robot-calibrated camera. Use the
+camera YAML for the camera that is present; for Bolt, the checked-in config
+uses the `/wrist_camera` topics:
+
+```bash
+ros2 run calibration_claude run_taught_capture \
+    --poses /franka_ws/poses.txt \
+    --cameras /franka_ws/src/calibration_claude/config/cameras_bolt.yaml \
+    --config /franka_ws/src/calibration_claude/config/calibration_hardware.yaml \
+    --out /franka_ws/session_bolt_YYYYMMDD
+
+ros2 run calibration_claude solve_handeye \
+    /franka_ws/session_bolt_YYYYMMDD \
+    --camera bolt \
+    --camera-frame bolt_camera \
+    --config /franka_ws/src/calibration_claude/config/calibration_hardware.yaml \
+    --output /franka_ws/session_bolt_YYYYMMDD_calibration.json
+```
+
+Capture only that camera for the stationary board measurement:
+
+```bash
+ros2 run calibration_claude capture_stereo_rgbd \
+    --camera bolt:/wrist_camera \
+    --output /franka_ws/captures/board_live_YYYYMMDD
+
+./run_stationary_pipeline.sh \
+    --data /franka_ws/captures/board_live_YYYYMMDD \
+    --reference-camera bolt \
+    --camera-base-calibration \
+        bolt=/franka_ws/session_bolt_YYYYMMDD_calibration.json
+```
+
+No camera-rig calibration or second `--camera-base-calibration` argument is
+needed. The result is written in `bolt_camera` and can be composed with the
+robot base using `export_robot_board_pose.py` as usual. Keep the camera and
+the robot stationary during this board capture; the hand-eye artifact is a
+fixed camera-to-base calibration.
+
+### Stationary two-camera rig
+
+Start the two cameras in separate container terminals.  The launch files carry
+the measured exposure defaults (Mega 110, Bolt 26), so no command-line camera
+overrides are needed:
+
+```bash
+ros2 launch orbbec_camera 4k_mega.launch.py
+ros2 launch orbbec_camera 4k_bolt.launch.py
+```
+
+Capture a dedicated rig-calibration session from a third container terminal:
+
+```bash
+source /opt/ros/humble/setup.bash
+source /franka_ws/install/setup.bash
+ros2 run calibration_claude capture_stereo_rgbd \
+    --output /franka_ws/captures/pose_refinement_rig_YYYYMMDD
+```
+
+Leave both cameras fixed.  Move the board flat across the table and press Enter
+once at each placement.  Vary x/y position and yaw as widely as both cameras
+allow; nine placements are recommended and eight are required.  The capture
+node waits for the scene to settle and obtains one fresh RGB-D pair from each
+camera independently.  The board must remain stationary until both views have
+arrived; their inter-camera timestamp span is recorded for diagnostics but is
+not used as an acceptance gate.
+
+For captures laid out as `capture_NNNN/<camera>/` (as in `run_01`), use the
+stationary-rig entry point instead of the single-camera workflow:
+
+```bash
+./run_stationary_pipeline.sh --data run_01 --reference-camera mega
+```
+
+It fits every native **3840 x 2160** image using that camera's own
+`camera_info.json`, estimates the fixed transform from `mega` to `bolt` from
+the synchronized pairs, and writes board poses in the selected reference
+camera frame.  There is intentionally no robot-base transform in this result:
+apply your later camera-to-base calibration as a left multiplication.
+
+The command also writes `boardpose/out_stationary_overlays/<dataset>/capture_NNNN.png`,
+native-resolution `capture_NNNN_<camera>_4k.png` files, and `scene_3d.png`.
+Each image pair has the fitted top rims and board outline in green, and the
+visible pocket-floor rims in cyan. In a calibrated run, magenta/orange also
+shows the local image refinement: it should closely overlap the shared
+green/cyan rig pose. Verify these contours at native resolution before using a
+pose. The 3D scene shows the fixed camera rig and every fitted board pose in
+the reference-camera frame. A rig estimated from just one synchronized pair is
+reported as unverified. One current pair can, however, verify a previously
+accepted fixed rig; export is blocked if that check fails.
+
+To make a reusable calibration from a dedicated, varied capture set, run:
+
+```bash
+.venv/bin/python boardpose/calibrate_stationary_rig.py --data run_calibration \
+    --reference-camera mega --out boardpose/out/camera_rig_calib.json
+```
+
+This first checks full-4K outer-board rectangles and writes annotated previews
+next to the calibration JSON. It records the fixed camera transform,
+camera-info provenance, capture timing, per-camera top/floor rim-bias terms,
+and accepted or rejected pairs. Eight varied pairs are required to identify
+the rim-bias terms; nine or more give the leave-one-out validation useful
+redundancy. The outer rectangle deliberately supplies all four cyclic pose
+hypotheses, so the unmarked rectangle's yaw convention cannot contaminate the
+rig transform.
+
+Transparent acrylic and clutter can make automatic rectangle detection reject
+an otherwise valid capture. In that case, use the same existing photos and
+click the four outer corners in each image for at least eight synchronized
+pairs:
+
+```bash
+.venv/bin/python boardpose/calibrate_stationary_rig.py --data run_calibration \
+    --reference-camera mega --out boardpose/out/camera_rig_calib.json \
+    --manual-outlines --restart-outlines
+```
+
+Corners may be clicked in any order. The calibration preserves progress in
+`camera_rig_calib.outline_detections.json`; omit `--restart-outlines` when
+resuming a partially completed manual session. Use it when replacing a failed
+automatic pass, as shown above. The clicked outline only initializes the
+calibration. The default final pass independently fits each reference image at
+full resolution, uses that pose only to seed an unconstrained local refinement
+of the synchronized secondary view, learns a bounded constant top/floor rim
+bias for each camera, then freezes those biases while jointly fitting the rig
+and one board pose per capture. This is much less sensitive to the ambiguous
+acrylic outer edge and prevents a camera-specific rim bias from being absorbed
+into the inter-camera transform.
+
+Because the board is constrained to the table, calibration uses broad yaw and
+table-position coverage rather than requiring tilt. The output is accepted
+only after optimizer, rank, residual, capture-count, intrinsic-provenance,
+timing, and leave-one-out checks pass.
+
+If the same cameras and image settings are retained but one mount moved, use
+the six-placement transform-only recalibration procedure in
+[`docs/ROBOT_BOARD_PIPELINE.md`](docs/ROBOT_BOARD_PIPELINE.md). It reuses the
+validated per-camera rim biases while solving and validating a fresh rig
+transform. A camera, lens, board, image-mode, focus, exposure, or intrinsics
+change still requires the full calibration above.
+
+Use that saved rig for measurements. In this mode `mega` is fitted normally,
+then its board pose is projected into `bolt` through the fixed rig transform.
+The local `bolt` refinement is retained as a rig-consistency diagnostic; the
+reported result comes from one shared board pose fitted against both raw 4K
+images. The overlay is drawn from that shared pose in both cameras, so a bad
+independent `bolt` seed cannot replace the result.
+
+```bash
+./run_stationary_pipeline.sh --data run_02 --reference-camera mega \
+    --calibration boardpose/out/camera_rig_calib.json
+```
+
 ### 1. Take photos
 
 Move the arm around the board and shoot. Leave the script running between

@@ -163,6 +163,7 @@ def edge_distance_transform(img, lo=20, hi=60, blur=1.6):
 # put every candidate at the wrong scale -- a 25 mm error at 430 mm standoff is
 # a 6% size error, far more than the chamfer basin tolerates.
 H_RANGE = np.arange(-0.010, 0.0551, 0.008)
+BRIGHT_SEED_H_RANGE = np.arange(-0.070, 0.0601, 0.008)
 
 
 def _sample_dt(dt, x, y):
@@ -293,8 +294,11 @@ def _score_uv_grid(dt, rotated_points, centres, width, height):
     """
     placed = rotated_points[None, :, :] + centres[:, None, :]
     depth = np.maximum(placed[..., 2], 1e-6)
-    x = np.rint(K_4K[0, 0] * placed[..., 0] / depth + K_4K[0, 2]).astype(np.int32)
-    y = np.rint(K_4K[1, 1] * placed[..., 1] / depth + K_4K[1, 2]).astype(np.int32)
+    with np.errstate(invalid="ignore", over="ignore"):
+        x = K_4K[0, 0] * placed[..., 0] / depth + K_4K[0, 2]
+        y = K_4K[1, 1] * placed[..., 1] / depth + K_4K[1, 2]
+    x = np.rint(np.nan_to_num(x, nan=-1, posinf=width, neginf=-1)).astype(np.int32)
+    y = np.rint(np.nan_to_num(y, nan=-1, posinf=height, neginf=-1)).astype(np.int32)
 
     in_frame = (x >= 0) & (x < width) & (y >= 0) & (y < height)
     np.clip(x, 0, width - 1, out=x)
@@ -318,8 +322,8 @@ def _best_of_grid(score, UV, yaw, height, keep=40):
 
 
 def search(dt, Rp, tp, n, yaw_step=2.0, uv_span=0.16, uv_step=0.010,
-           n_polish=700,
-           n_pts=140, topk=20, h_range=H_RANGE):
+           n_polish=700, n_pts=140, topk=20, h_range=H_RANGE,
+           progress=None, uv_center=(0.0, 0.0)):
     """4-DoF chamfer search: yaw, in-plane u/v, and height above the plane.
 
     Step sizes are set by the refine's capture radius, not by taste. The board
@@ -351,13 +355,18 @@ def search(dt, Rp, tp, n, yaw_step=2.0, uv_span=0.16, uv_step=0.010,
     P = board_model.pts3(pts2[sel])                       # n_pts x 3
 
     Hh, W = dt.shape
-    us = np.arange(-uv_span, uv_span + 1e-9, uv_step)
-    U, V = np.meshgrid(us, us, indexing="ij")
+    us = np.arange(-uv_span, uv_span + 1e-9, uv_step) + uv_center[0]
+    vs = np.arange(-uv_span, uv_span + 1e-9, uv_step) + uv_center[1]
+    U, V = np.meshgrid(us, vs, indexing="ij")
     UV = np.stack([U.ravel(), V.ravel()], 1)              # n_uv x 2
     base = tp + UV[:, 0:1] * Rp[:, 0] + UV[:, 1:2] * Rp[:, 1]
 
     candidates = []
-    for yaw in np.arange(0, 360, yaw_step) * DEG:
+    yaws = np.arange(0, 360, yaw_step) * DEG
+    report_every = max(1, len(yaws) // 10)
+    for yaw_index, yaw in enumerate(yaws):
+        if progress is not None and yaw_index % report_every == 0:
+            progress(f"seed grid {yaw_index / len(yaws):.0%}")
         rotated = P @ _yaw_rotation(Rp, yaw).T            # n_pts x 3
         for height in h_range:
             centres = base + height * n
@@ -387,7 +396,9 @@ def search(dt, Rp, tp, n, yaw_step=2.0, uv_span=0.16, uv_step=0.010,
     # polish each, THEN rank -- ranking raw grid scores puts the true pose
     # around 235th, ranking polished scores puts it first
     pol = []
-    for s_, yaw, u, v, h in coarse:
+    for candidate_index, (s_, yaw, u, v, h) in enumerate(coarse):
+        if progress is not None and candidate_index % max(1, len(coarse) // 10) == 0:
+            progress(f"seed polish {candidate_index / len(coarse):.0%}")
         loc, _ = local_uv(dt, P, Rp, tp, n, (yaw, u, v, h))
         par, cost = polish(dt, P, Rp, tp, n, loc)
         if np.isfinite(cost):
@@ -402,12 +413,61 @@ def search(dt, Rp, tp, n, yaw_step=2.0, uv_span=0.16, uv_step=0.010,
             keep.append(c)
         if len(keep) >= topk:
             break
+    if progress is not None:
+        progress("seed complete")
     return keep
 
 
 # ---------------------------------------------------------------- api
 
-def seed_view(view_dir, topk=20, yaw_step=2.0, uv_step=0.010):
+def _bright_board_seed(image, depth, Rp, tp):
+    """Estimate the board centre from the central bright acrylic region.
+
+    This is only a coarse seed: the CAD rim fit remains the pose estimator.
+    It deliberately ignores the image border, where boxes and robot hardware
+    are common in stationary-rig captures.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape
+    x0, x1 = int(width * 0.25), int(width * 0.90)
+    y0, y1 = int(height * 0.20), int(height * 0.90)
+    region = gray[y0:y1, x0:x1]
+    threshold, _ = cv2.threshold(region, 0, 255,
+                                 cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = np.zeros_like(gray, dtype=np.uint8)
+    mask[y0:y1, x0:x1] = (region >= threshold).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    count, _, stats, centres = cv2.connectedComponentsWithStats(mask)
+    target = np.array([width * 0.55, height * 0.55])
+    candidates = []
+    for label in range(1, count):
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area < 3000:
+            continue
+        centre = centres[label]
+        distance = np.linalg.norm((centre - target) / [width, height])
+        candidates.append((distance, centre))
+    if not candidates:
+        return None
+    _, centre = min(candidates, key=lambda candidate: candidate[0])
+    cx, cy = np.rint(centre).astype(int)
+    radius = 35
+    neighbourhood = depth[max(0, cy - radius):cy + radius + 1,
+                          max(0, cx - radius):cx + radius + 1]
+    valid_depth = neighbourhood[(neighbourhood > 250) & (neighbourhood < 3000)]
+    if len(valid_depth) < 100:
+        return None
+    z = float(np.median(valid_depth)) / 1000.0
+    point = np.array([(centre[0] - K_4K[0, 2]) / K_4K[0, 0] * z,
+                      (centre[1] - K_4K[1, 2]) / K_4K[1, 1] * z, z])
+    plane_coordinates = Rp.T @ (point - tp)
+    return plane_coordinates[:2], [round(float(centre[0])), round(float(centre[1]))]
+
+
+def seed_view(view_dir, topk=20, yaw_step=2.0, uv_step=0.010,
+              uv_span=0.16, progress=None, bright_seed=False,
+              bright_uv_span=0.18):
     """Ranked candidate T_cam_board for one view. Returns (list, info)."""
     view_dir = Path(view_dir)
     img = cv2.imread(str(view_dir / "color.png"))
@@ -421,11 +481,26 @@ def seed_view(view_dir, topk=20, yaw_step=2.0, uv_step=0.010):
     n, d, inl = pl
     Rp, tp, nn = plane_frame(n, d)
 
+    uv_center = (0.0, 0.0)
+    search_span = uv_span
+    height_range = H_RANGE
+    bright_center_px = None
+    if bright_seed:
+        bright = _bright_board_seed(img, depth, Rp, tp)
+        if bright is not None:
+            uv_center, bright_center_px = bright
+            search_span = bright_uv_span
+            height_range = BRIGHT_SEED_H_RANGE
+            if progress is not None:
+                progress(f"bright-board seed at {bright_center_px[0]}, {bright_center_px[1]}")
+
     img_u = cv2.undistort(img, K_4K.astype(np.float32), D_4K,
                           newCameraMatrix=K_4K.astype(np.float32))
     dt = edge_distance_transform(img_u)
 
-    cands = search(dt, Rp, tp, nn, topk=topk, yaw_step=yaw_step, uv_step=uv_step)
+    cands = search(dt, Rp, tp, nn, topk=topk, yaw_step=yaw_step,
+                   uv_step=uv_step, uv_span=search_span, progress=progress,
+                   uv_center=uv_center, h_range=height_range)
     Ts = []
     for s_, yaw, u, v, h in cands:
         R, t = pose_on_plane(yaw, u, v, h, Rp, tp, nn)
@@ -433,6 +508,7 @@ def seed_view(view_dir, topk=20, yaw_step=2.0, uv_step=0.010):
         Ts.append((s_, T))
     return Ts, {"plane_inlier_frac": round(inl, 3),
                 "plane_normal": [round(float(q), 4) for q in nn],
+                "bright_seed_px": bright_center_px,
                 "n_cand": len(Ts),
                 "best_chamfer": round(cands[0][0], 2) if cands else None}
 

@@ -1,6 +1,8 @@
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+.pytest_cache/
 .venv/
 .venv2/
 
@@ -16,6 +18,10 @@ Thumbs.db
 # Captures: 4K colour+depth frames. These are the measurements, not the code,
 # and they do not belong in git.
 images/
+# Capture runs (capture_NNNN/ with frames + camera info). The README uses
+# run_calibration as an example path; bring your own data.
+run_*/
+live_baseline/
 
 # ------------------------------------------------------------ third party
 # Leftover local checkouts from the removed GLU-Net path. Nothing in the
